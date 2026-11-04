@@ -1,3 +1,4 @@
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -62,6 +63,7 @@ function makeRoom(code) {
     hostId: null,
     phase: "lobby",
     bots: makeBots(),
+    botProjectiles: [],
     chests: [],
     worldReady: false,
     structures: [],
@@ -127,6 +129,10 @@ function leaveRoom(socket) {
   if (!room.players.size) {
     rooms.delete(code);
   } else {
+    if (room.hostId === socket.id) {
+      room.hostId = room.players.keys().next().value;
+      if (room.phase === "countdown") room.phase = "lobby";
+    }
     emitState(room);
   }
 }
@@ -146,10 +152,6 @@ function applyDamage(player, amount) {
   }
 }
 
-function playerById(room, id) {
-  return room.players.get(id);
-}
-
 io.on("connection", socket => {
 
   socket.on("createRoom", (payload = {}, cb = () => {}) => {
@@ -162,18 +164,12 @@ io.on("connection", socket => {
     room.players.set(socket.id, {
       id: socket.id,
       name: cleanName(payload.name),
-      x: 0,
-      y: 0,
-      z: 0,
-      yaw: 0,
-      pitch: 0,
-      health: 100,
-      shield: 100,
+      x: 0, y: 0, z: 0,
+      yaw: 0, pitch: 0,
+      health: 100, shield: 100,
       alive: true,
-      medkits: 0,
-      potions: 0,
-      kills: 0,
-      materials: 100,
+      medkits: 0, potions: 0,
+      kills: 0, materials: 100,
       lastShot: 0
     });
 
@@ -203,10 +199,7 @@ io.on("connection", socket => {
     const room = rooms.get(code);
 
     if (!room) {
-      return cb({
-        ok: false,
-        error: "That room code was not found."
-      });
+      return cb({ ok: false, error: "That room code was not found." });
     }
 
     if (room.phase !== "lobby") {
@@ -232,18 +225,12 @@ io.on("connection", socket => {
     room.players.set(socket.id, {
       id: socket.id,
       name: cleanName(payload.name),
-      x: spawn.x,
-      y: 0,
-      z: spawn.z,
-      yaw: 0,
-      pitch: 0,
-      health: 100,
-      shield: 100,
+      x: spawn.x, y: 0, z: spawn.z,
+      yaw: 0, pitch: 0,
+      health: 100, shield: 100,
       alive: true,
-      medkits: 0,
-      potions: 0,
-      kills: 0,
-      materials: 100,
+      medkits: 0, potions: 0,
+      kills: 0, materials: 100,
       lastShot: 0
     });
 
@@ -265,9 +252,7 @@ io.on("connection", socket => {
   socket.on("startMatch", (_data = {}, cb = () => {}) => {
     const room = getRoom(socket);
 
-    if (!room) {
-      return cb({ ok: false, error: "Join a room first." });
-    }
+    if (!room) return cb({ ok: false, error: "Join a room first." });
 
     if (socket.id !== room.hostId) {
       return cb({
@@ -299,11 +284,8 @@ io.on("connection", socket => {
     setTimeout(() => {
       const current = rooms.get(room.code);
 
-      if (
-        !current ||
-        current.phase !== "countdown" ||
-        current.startAt !== scheduledStart
-      ) return;
+      if (!current || current.phase !== "countdown" ||
+          current.startAt !== scheduledStart) return;
 
       current.phase = "playing";
 
@@ -331,11 +313,8 @@ io.on("connection", socket => {
     socket.to(room.code).emit("playerMoved", {
       id: p.id,
       name: p.name,
-      x: p.x,
-      y: p.y,
-      z: p.z,
-      yaw: p.yaw,
-      pitch: p.pitch,
+      x: p.x, y: p.y, z: p.z,
+      yaw: p.yaw, pitch: p.pitch,
       health: p.health,
       shield: p.shield,
       alive: p.alive
@@ -349,7 +328,6 @@ io.on("connection", socket => {
     if (!room || !shooter || !shooter.alive) return;
 
     const now = Date.now();
-
     if (now - shooter.lastShot < 85) return;
     shooter.lastShot = now;
 
@@ -365,7 +343,6 @@ io.on("connection", socket => {
     let dz = number(d.z, -1, -1, 1);
 
     const len = Math.hypot(dx, dy, dz) || 1;
-
     dx /= len;
     dy /= len;
     dz /= len;
@@ -373,14 +350,9 @@ io.on("connection", socket => {
     for (const target of room.players.values()) {
       if (target.id === shooter.id || !target.alive) continue;
 
-      const tx = target.x;
-      const ty = target.y + 1.2;
-      const tz = target.z;
-
-      const vx = tx - ox;
-      const vy = ty - oy;
-      const vz = tz - oz;
-
+      const vx = target.x - ox;
+      const vy = (target.y + 1.2) - oy;
+      const vz = target.z - oz;
       const along = vx * dx + vy * dy + vz * dz;
 
       if (along < 0 || along > 90) continue;
@@ -393,11 +365,7 @@ io.on("connection", socket => {
 
       if (dist < 1.25) {
         applyDamage(target, 25);
-
-        if (!target.alive) {
-          shooter.kills++;
-        }
-
+        if (!target.alive) shooter.kills++;
         emitState(room);
         break;
       }
@@ -410,20 +378,14 @@ io.on("connection", socket => {
 
     if (!room || !p || !p.alive) return;
 
-    const bot = room.bots.find(
-      b => b.id === String(data.id)
-    );
-
+    const bot = room.bots.find(b => b.id === String(data.id));
     if (!bot || !bot.alive) return;
 
     const amount = number(data.amount, 25, 0, 50);
     const absorbed = Math.min(bot.shield, amount);
 
     bot.shield -= absorbed;
-    bot.health = Math.max(
-      0,
-      bot.health - (amount - absorbed)
-    );
+    bot.health = Math.max(0, bot.health - (amount - absorbed));
 
     if (bot.health <= 0) {
       bot.alive = false;
@@ -435,7 +397,6 @@ io.on("connection", socket => {
 
   socket.on("registerWorld", data => {
     const room = getRoom(socket);
-
     if (!room || room.worldReady) return;
 
     const positions = Array.isArray(data.chests)
@@ -462,22 +423,14 @@ io.on("connection", socket => {
 
     const chest = room.chests[Number(data.index)];
 
-    if (
-      !chest ||
-      chest.opened ||
-      Math.hypot(p.x - chest.x, p.z - chest.z) > 5
-    ) return;
+    if (!chest || chest.opened ||
+        Math.hypot(p.x - chest.x, p.z - chest.z) > 5) return;
 
     chest.opened = true;
-    chest.loot = Math.random() < 0.5
-      ? "medkit"
-      : "potion";
+    chest.loot = Math.random() < 0.5 ? "medkit" : "potion";
 
-    if (chest.loot === "medkit") {
-      p.medkits++;
-    } else {
-      p.potions++;
-    }
+    if (chest.loot === "medkit") p.medkits++;
+    else p.potions++;
 
     emitState(room);
 
@@ -497,11 +450,7 @@ io.on("connection", socket => {
     if (data.type === "medkit" && p.medkits > 0 && p.health < 100) {
       p.medkits--;
       p.health = Math.min(100, p.health + 40);
-    } else if (
-      data.type === "potion" &&
-      p.potions > 0 &&
-      p.shield < 100
-    ) {
+    } else if (data.type === "potion" && p.potions > 0 && p.shield < 100) {
       p.potions--;
       p.shield = Math.min(100, p.shield + 40);
     }
@@ -515,9 +464,7 @@ io.on("connection", socket => {
 
     if (!room || !p || !p.alive || p.materials < 10) return;
 
-    const type = data.type === "ramp"
-      ? "ramp"
-      : "wall";
+    const type = data.type === "ramp" ? "ramp" : "wall";
 
     const structure = {
       id: `${socket.id}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
@@ -531,9 +478,7 @@ io.on("connection", socket => {
     p.materials -= 10;
     room.structures.push(structure);
 
-    if (room.structures.length > 100) {
-      room.structures.shift();
-    }
+    if (room.structures.length > 100) room.structures.shift();
 
     emitState(room);
   });
@@ -545,13 +490,9 @@ io.on("connection", socket => {
     if (!room || !p || !p.alive) return;
 
     const type = String(data.type || "").slice(0, 16);
-
-    if (!["truck", "sedan", "sports", "suv"].includes(type)) {
-      return;
-    }
+    if (!["truck", "sedan", "sports", "suv"].includes(type)) return;
 
     room.vehicles ||= {};
-
     room.vehicles[type] = {
       type,
       x: number(data.x, p.x),
@@ -560,10 +501,7 @@ io.on("connection", socket => {
       driver: socket.id
     };
 
-    io.to(room.code).emit(
-      "vehicleMoved",
-      room.vehicles[type]
-    );
+    io.to(room.code).emit("vehicleMoved", room.vehicles[type]);
   });
 
   socket.on("playerVitals", data => {
@@ -583,30 +521,21 @@ io.on("connection", socket => {
   socket.on("disconnect", () => leaveRoom(socket));
 });
 
-// Shared bot movement, attacks, and storm simulation.
+// Bot AI and projectile simulation.
 setInterval(() => {
   const now = Date.now();
 
   for (const room of rooms.values()) {
-    const dt = Math.min(
-      0.2,
-      (now - room.lastTick) / 1000
-    );
-
+    const dt = Math.min(0.2, (now - room.lastTick) / 1000);
     room.lastTick = now;
 
-    const living = [...room.players.values()]
-      .filter(p => p.alive);
-
+    const living = [...room.players.values()].filter(p => p.alive);
     if (!living.length) continue;
 
     room.stormTime += dt;
 
     if (room.stormTime > 15) {
-      room.stormRadius = Math.max(
-        25,
-        room.stormRadius - dt * 0.8
-      );
+      room.stormRadius = Math.max(25, room.stormRadius - dt * 0.8);
     }
 
     for (const bot of room.bots) {
@@ -616,11 +545,7 @@ setInterval(() => {
       let best = Infinity;
 
       for (const p of living) {
-        const d = Math.hypot(
-          p.x - bot.x,
-          p.z - bot.z
-        );
-
+        const d = Math.hypot(p.x - bot.x, p.z - bot.z);
         if (d < best) {
           best = d;
           target = p;
@@ -633,21 +558,54 @@ setInterval(() => {
         const dx = target.x - bot.x;
         const dz = target.z - bot.z;
         const len = Math.hypot(dx, dz) || 1;
-
         bot.x += dx / len * 1.6 * dt;
         bot.z += dz / len * 1.6 * dt;
       }
 
       bot.fire -= dt;
 
+      // Create a projectile instead of damaging the player instantly.
       if (best < 65 && bot.fire <= 0) {
-        applyDamage(target, 10);
+        const origin = { x: bot.x, y: 1.5, z: bot.z };
+        const targetPoint = {
+          x: target.x,
+          y: target.y + 1.1,
+          z: target.z
+        };
+
+        const dx = targetPoint.x - origin.x;
+        const dy = targetPoint.y - origin.y;
+        const dz = targetPoint.z - origin.z;
+        const length = Math.hypot(dx, dy, dz) || 1;
+        const direction = {
+          x: dx / length,
+          y: dy / length,
+          z: dz / length
+        };
+
+        room.botProjectiles.push({
+          id: `botshot-${Date.now()}-${Math.floor(Math.random() * 1e9)}`,
+          x: origin.x,
+          y: origin.y,
+          z: origin.z,
+          vx: direction.x * 42,
+          vy: direction.y * 42,
+          vz: direction.z * 42,
+          targetId: target.id,
+          life: 3
+        });
+
+        io.to(room.code).emit("botProjectile", {
+          origin,
+          direction,
+          speed: 42
+        });
+
         bot.fire = 1.5 + Math.random() * 1.5;
       }
 
       if (Math.hypot(bot.x, bot.z) > room.stormRadius) {
         bot.health -= dt * 2;
-
         if (bot.health <= 0) {
           bot.health = 0;
           bot.alive = false;
@@ -655,11 +613,38 @@ setInterval(() => {
       }
     }
 
+    // Move each projectile and damage only when it reaches its target.
+    for (let i = room.botProjectiles.length - 1; i >= 0; i--) {
+      const shot = room.botProjectiles[i];
+
+      shot.x += shot.vx * dt;
+      shot.y += shot.vy * dt;
+      shot.z += shot.vz * dt;
+      shot.life -= dt;
+
+      const target = room.players.get(shot.targetId);
+
+      if (target && target.alive) {
+        const distance = Math.hypot(
+          target.x - shot.x,
+          (target.y + 1.1) - shot.y,
+          target.z - shot.z
+        );
+
+        if (distance < 1.15) {
+          applyDamage(target, 10);
+          room.botProjectiles.splice(i, 1);
+          continue;
+        }
+      }
+
+      if (shot.life <= 0) {
+        room.botProjectiles.splice(i, 1);
+      }
+    }
+
     for (const p of room.players.values()) {
-      if (
-        p.alive &&
-        Math.hypot(p.x, p.z) > room.stormRadius
-      ) {
+      if (p.alive && Math.hypot(p.x, p.z) > room.stormRadius) {
         p._stormDamage = (p._stormDamage || 0) + dt;
 
         if (p._stormDamage >= 2) {
@@ -676,9 +661,7 @@ setInterval(() => {
 }, 100);
 
 const server = httpServer.listen(PORT, () =>
-  console.log(
-    `Battle Royale multiplayer server listening on port ${PORT}`
-  )
+  console.log(`Battle Royale multiplayer server listening on port ${PORT}`)
 );
 
 process.on("SIGTERM", () =>
