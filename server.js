@@ -1,29 +1,26 @@
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const crypto = require("crypto");
 
 const app = express();
 const httpServer = http.createServer(app);
-
 const io = new Server(httpServer, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
   transports: ["websocket", "polling"]
 });
 
 const PORT = process.env.PORT || 3000;
 const rooms = new Map();
+const MAX_PLAYERS = 2;
 
-app.get("/", (_req, res) => {
-  res.type("text").send("Battle Royale multiplayer server is online.");
-});
+app.get("/", (_req, res) =>
+  res.type("text").send("Battle Royale multiplayer server is online.")
+);
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, rooms: rooms.size });
-});
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, rooms: rooms.size })
+);
 
 function makeRoomCode() {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -36,157 +33,82 @@ function makeRoomCode() {
   return code;
 }
 
+function cleanName(v) {
+  return String(v || "Player").trim().slice(0, 16) || "Player";
+}
+
+function number(v, fallback = 0, min = -260, max = 260) {
+  const n = Number(v);
+  return Number.isFinite(n)
+    ? Math.max(min, Math.min(max, n))
+    : fallback;
+}
+
 function makeBots() {
   return Array.from({ length: 10 }, (_, i) => ({
     id: `bot-${i + 1}`,
-    x: Math.random() * 180 - 90,
-    z: Math.random() * 180 - 90,
+    x: Math.random() * 200 - 100,
+    z: Math.random() * 200 - 100,
     health: 100,
-    alive: true
+    shield: 25,
+    alive: true,
+    fire: 1 + Math.random() * 2
   }));
 }
 
-function publicRoomState(room) {
+function makeRoom(code) {
   return {
-    roomCode: room.code,
-    players: Array.from(room.players.values()).map(player => ({
-      id: player.id,
-      name: player.name,
-      x: player.x,
-      y: player.y,
-      z: player.z,
-      yaw: player.yaw,
-      pitch: player.pitch,
-      health: player.health,
-      shield: player.shield,
-      alive: player.alive
-    })),
-    bots: room.bots.map(bot => ({ ...bot }))
+    code,
+    players: new Map(),
+    bots: makeBots(),
+    chests: [],
+    worldReady: false,
+    structures: [],
+    stormRadius: 230,
+    stormTime: 0,
+    lastTick: Date.now(),
+    createdAt: Date.now()
   };
 }
 
-function emitRoomState(room) {
-  io.to(room.code).emit("roomState", publicRoomState(room));
+function stateOf(room) {
+  return {
+    roomCode: room.code,
+    players: [...room.players.values()].map(p => ({
+      id: p.id,
+      name: p.name,
+      x: p.x,
+      y: p.y,
+      z: p.z,
+      yaw: p.yaw,
+      pitch: p.pitch,
+      health: p.health,
+      shield: p.shield,
+      alive: p.alive,
+      medkits: p.medkits,
+      potions: p.potions,
+      kills: p.kills,
+      materials: p.materials
+    })),
+    bots: room.bots.map(b => ({ ...b })),
+    chests: room.chests.map(c => ({ ...c })),
+    structures: room.structures.map(s => ({ ...s })),
+    stormRadius: room.stormRadius,
+    stormTime: room.stormTime
+  };
 }
 
-function cleanName(value) {
-  const name = String(value || "Player").trim().slice(0, 16);
-  return name || "Player";
+function emitState(room) {
+  io.to(room.code).emit("roomState", stateOf(room));
 }
 
-function cleanNumber(value, fallback = 0, min = -260, max = 260) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, n));
+function getRoom(socket) {
+  return socket.data.roomCode
+    ? rooms.get(socket.data.roomCode)
+    : null;
 }
 
-io.on("connection", socket => {
-  socket.on("createRoom", (payload = {}, callback = () => {}) => {
-    // A socket may only belong to one game room at a time.
-    leaveCurrentRoom(socket);
-
-    const code = makeRoomCode();
-    const room = {
-      code,
-      players: new Map(),
-      bots: makeBots(),
-      createdAt: Date.now()
-    };
-
-    room.players.set(socket.id, {
-      id: socket.id,
-      name: cleanName(payload.name),
-      x: 0, y: 0, z: 0,
-      yaw: 0, pitch: 0,
-      health: 100, shield: 100,
-      alive: true
-    });
-
-    rooms.set(code, room);
-    socket.join(code);
-    socket.data.roomCode = code;
-
-    callback({ ok: true, roomCode: code, playerId: socket.id });
-    emitRoomState(room);
-  });
-
-  socket.on("joinRoom", (payload = {}, callback = () => {}) => {
-    leaveCurrentRoom(socket);
-
-    const code = String(payload.roomCode || "").trim().toUpperCase();
-    const room = rooms.get(code);
-
-    if (!room) {
-      callback({ ok: false, error: "That room code was not found." });
-      return;
-    }
-    if (room.players.size >= 2) {
-      callback({ ok: false, error: "That room is full (2 players maximum)." });
-      return;
-    }
-
-    room.players.set(socket.id, {
-      id: socket.id,
-      name: cleanName(payload.name),
-      x: 4, y: 0, z: 0,
-      yaw: 0, pitch: 0,
-      health: 100, shield: 100,
-      alive: true
-    });
-
-    socket.join(code);
-    socket.data.roomCode = code;
-
-    callback({ ok: true, roomCode: code, playerId: socket.id });
-    emitRoomState(room);
-  });
-
-  socket.on("playerUpdate", (data = {}) => {
-    const room = getSocketRoom(socket);
-    if (!room) return;
-
-    const player = room.players.get(socket.id);
-    if (!player || !player.alive) return;
-
-    player.x = cleanNumber(data.x, player.x);
-    player.y = cleanNumber(data.y, player.y, -20, 100);
-    player.z = cleanNumber(data.z, player.z);
-    player.yaw = cleanNumber(data.yaw, player.yaw, -1000, 1000);
-    player.pitch = cleanNumber(data.pitch, player.pitch, -2, 2);
-
-    // Send the updated position to the other player.
-    socket.to(room.code).emit("playerMoved", {
-      id: player.id,
-      name: player.name,
-      x: player.x, y: player.y, z: player.z,
-      yaw: player.yaw, pitch: player.pitch
-    });
-  });
-
-  socket.on("playerVitals", (data = {}) => {
-    const room = getSocketRoom(socket);
-    if (!room) return;
-    const player = room.players.get(socket.id);
-    if (!player) return;
-    player.health = cleanNumber(data.health, player.health, 0, 100);
-    player.shield = cleanNumber(data.shield, player.shield, 0, 100);
-    player.alive = data.alive !== false && player.health > 0;
-    emitRoomState(room);
-  });
-
-  socket.on("leaveRoom", () => leaveCurrentRoom(socket));
-
-  socket.on("disconnect", () => {
-    leaveCurrentRoom(socket);
-  });
-});
-
-function getSocketRoom(socket) {
-  const code = socket.data.roomCode;
-  return code ? rooms.get(code) : null;
-}
-
-function leaveCurrentRoom(socket) {
+function leaveRoom(socket) {
   const code = socket.data.roomCode;
   if (!code) return;
 
@@ -195,55 +117,494 @@ function leaveCurrentRoom(socket) {
   delete socket.data.roomCode;
 
   if (!room) return;
+
   room.players.delete(socket.id);
 
-  if (room.players.size === 0) {
+  if (!room.players.size) {
     rooms.delete(code);
   } else {
-    emitRoomState(room);
+    emitState(room);
   }
 }
 
-// Lightweight bot movement is maintained on the server so both clients
-// can receive the same bot positions. Combat/health synchronization is a
-// later integration step in the game client.
+function applyDamage(player, amount) {
+  if (!player || !player.alive) return;
+
+  let remaining = Math.max(0, amount);
+  const absorbed = Math.min(player.shield, remaining);
+
+  player.shield -= absorbed;
+  remaining -= absorbed;
+  player.health = Math.max(0, player.health - remaining);
+
+  if (player.health <= 0) {
+    player.alive = false;
+  }
+}
+
+function playerById(room, id) {
+  return room.players.get(id);
+}
+
+io.on("connection", socket => {
+
+  socket.on("createRoom", (payload = {}, cb = () => {}) => {
+    leaveRoom(socket);
+
+    const code = makeRoomCode();
+    const room = makeRoom(code);
+
+    room.players.set(socket.id, {
+      id: socket.id,
+      name: cleanName(payload.name),
+      x: 0,
+      y: 0,
+      z: 0,
+      yaw: 0,
+      pitch: 0,
+      health: 100,
+      shield: 100,
+      alive: true,
+      medkits: 0,
+      potions: 0,
+      kills: 0,
+      materials: 100,
+      lastShot: 0
+    });
+
+    rooms.set(code, room);
+    socket.join(code);
+    socket.data.roomCode = code;
+
+    cb({
+      ok: true,
+      roomCode: code,
+      playerId: socket.id,
+      spawnX: 0
+    });
+
+    emitState(room);
+  });
+
+  socket.on("joinRoom", (payload = {}, cb = () => {}) => {
+    leaveRoom(socket);
+
+    const code = String(payload.roomCode || "")
+      .trim()
+      .toUpperCase();
+
+    const room = rooms.get(code);
+
+    if (!room) {
+      return cb({
+        ok: false,
+        error: "That room code was not found."
+      });
+    }
+
+    if (room.players.size >= MAX_PLAYERS) {
+      return cb({
+        ok: false,
+        error: "That room is full (2 players maximum)."
+      });
+    }
+
+    room.players.set(socket.id, {
+      id: socket.id,
+      name: cleanName(payload.name),
+      x: 4,
+      y: 0,
+      z: 0,
+      yaw: 0,
+      pitch: 0,
+      health: 100,
+      shield: 100,
+      alive: true,
+      medkits: 0,
+      potions: 0,
+      kills: 0,
+      materials: 100,
+      lastShot: 0
+    });
+
+    socket.join(code);
+    socket.data.roomCode = code;
+
+    cb({
+      ok: true,
+      roomCode: code,
+      playerId: socket.id,
+      spawnX: 4
+    });
+
+    emitState(room);
+  });
+
+  socket.on("playerUpdate", data => {
+    const room = getRoom(socket);
+    const p = room?.players.get(socket.id);
+
+    if (!p || !p.alive) return;
+
+    p.x = number(data.x, p.x);
+    p.y = number(data.y, p.y, -20, 100);
+    p.z = number(data.z, p.z);
+    p.yaw = number(data.yaw, p.yaw, -1000, 1000);
+    p.pitch = number(data.pitch, p.pitch, -2, 2);
+
+    socket.to(room.code).emit("playerMoved", {
+      id: p.id,
+      name: p.name,
+      x: p.x,
+      y: p.y,
+      z: p.z,
+      yaw: p.yaw,
+      pitch: p.pitch,
+      health: p.health,
+      shield: p.shield,
+      alive: p.alive
+    });
+  });
+
+  socket.on("shootPlayer", data => {
+    const room = getRoom(socket);
+    const shooter = room?.players.get(socket.id);
+
+    if (!room || !shooter || !shooter.alive) return;
+
+    const now = Date.now();
+
+    if (now - shooter.lastShot < 85) return;
+    shooter.lastShot = now;
+
+    const o = data.origin || {};
+    const d = data.direction || {};
+
+    const ox = number(o.x, shooter.x);
+    const oy = number(o.y, shooter.y + 1.7, -20, 100);
+    const oz = number(o.z, shooter.z);
+
+    let dx = number(d.x, 0, -1, 1);
+    let dy = number(d.y, 0, -1, 1);
+    let dz = number(d.z, -1, -1, 1);
+
+    const len = Math.hypot(dx, dy, dz) || 1;
+
+    dx /= len;
+    dy /= len;
+    dz /= len;
+
+    for (const target of room.players.values()) {
+      if (target.id === shooter.id || !target.alive) continue;
+
+      const tx = target.x;
+      const ty = target.y + 1.2;
+      const tz = target.z;
+
+      const vx = tx - ox;
+      const vy = ty - oy;
+      const vz = tz - oz;
+
+      const along = vx * dx + vy * dy + vz * dz;
+
+      if (along < 0 || along > 90) continue;
+
+      const dist = Math.hypot(
+        vx - dx * along,
+        vy - dy * along,
+        vz - dz * along
+      );
+
+      if (dist < 1.25) {
+        applyDamage(target, 25);
+
+        if (!target.alive) {
+          shooter.kills++;
+        }
+
+        emitState(room);
+        break;
+      }
+    }
+  });
+
+  socket.on("damageBot", data => {
+    const room = getRoom(socket);
+    const p = room?.players.get(socket.id);
+
+    if (!room || !p || !p.alive) return;
+
+    const bot = room.bots.find(
+      b => b.id === String(data.id)
+    );
+
+    if (!bot || !bot.alive) return;
+
+    const amount = number(data.amount, 25, 0, 50);
+    const absorbed = Math.min(bot.shield, amount);
+
+    bot.shield -= absorbed;
+    bot.health = Math.max(
+      0,
+      bot.health - (amount - absorbed)
+    );
+
+    if (bot.health <= 0) {
+      bot.alive = false;
+      p.kills++;
+    }
+
+    emitState(room);
+  });
+
+  socket.on("registerWorld", data => {
+    const room = getRoom(socket);
+
+    if (!room || room.worldReady) return;
+
+    const positions = Array.isArray(data.chests)
+      ? data.chests.slice(0, 100)
+      : [];
+
+    room.chests = positions.map((pos, i) => ({
+      id: i,
+      x: number(pos.x, 0),
+      z: number(pos.z, 0),
+      opened: false,
+      loot: null
+    }));
+
+    room.worldReady = true;
+    emitState(room);
+  });
+
+  socket.on("openChest", data => {
+    const room = getRoom(socket);
+    const p = room?.players.get(socket.id);
+
+    if (!room || !p || !p.alive) return;
+
+    const chest = room.chests[Number(data.index)];
+
+    if (
+      !chest ||
+      chest.opened ||
+      Math.hypot(p.x - chest.x, p.z - chest.z) > 5
+    ) return;
+
+    chest.opened = true;
+    chest.loot = Math.random() < 0.5
+      ? "medkit"
+      : "potion";
+
+    if (chest.loot === "medkit") {
+      p.medkits++;
+    } else {
+      p.potions++;
+    }
+
+    emitState(room);
+
+    socket.emit("gameNotice", {
+      message: chest.loot === "medkit"
+        ? "Found a MEDKIT! Press 4 to use it."
+        : "Found a SHIELD POTION! Press 5 to use it."
+    });
+  });
+
+  socket.on("useItem", data => {
+    const room = getRoom(socket);
+    const p = room?.players.get(socket.id);
+
+    if (!room || !p || !p.alive) return;
+
+    if (data.type === "medkit" && p.medkits > 0 && p.health < 100) {
+      p.medkits--;
+      p.health = Math.min(100, p.health + 40);
+    } else if (
+      data.type === "potion" &&
+      p.potions > 0 &&
+      p.shield < 100
+    ) {
+      p.potions--;
+      p.shield = Math.min(100, p.shield + 40);
+    }
+
+    emitState(room);
+  });
+
+  socket.on("buildStructure", data => {
+    const room = getRoom(socket);
+    const p = room?.players.get(socket.id);
+
+    if (!room || !p || !p.alive || p.materials < 10) return;
+
+    const type = data.type === "ramp"
+      ? "ramp"
+      : "wall";
+
+    const structure = {
+      id: `${socket.id}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+      owner: socket.id,
+      type,
+      x: number(data.x, p.x),
+      z: number(data.z, p.z),
+      yaw: number(data.yaw, p.yaw, -1000, 1000)
+    };
+
+    p.materials -= 10;
+    room.structures.push(structure);
+
+    if (room.structures.length > 100) {
+      room.structures.shift();
+    }
+
+    emitState(room);
+  });
+
+  socket.on("vehicleUpdate", data => {
+    const room = getRoom(socket);
+    const p = room?.players.get(socket.id);
+
+    if (!room || !p || !p.alive) return;
+
+    const type = String(data.type || "").slice(0, 16);
+
+    if (!["truck", "sedan", "sports", "suv"].includes(type)) {
+      return;
+    }
+
+    room.vehicles ||= {};
+
+    room.vehicles[type] = {
+      type,
+      x: number(data.x, p.x),
+      z: number(data.z, p.z),
+      yaw: number(data.yaw, p.yaw, -1000, 1000),
+      driver: socket.id
+    };
+
+    io.to(room.code).emit(
+      "vehicleMoved",
+      room.vehicles[type]
+    );
+  });
+
+  socket.on("playerVitals", data => {
+    const room = getRoom(socket);
+    const p = room?.players.get(socket.id);
+
+    if (!room || !p) return;
+
+    p.health = number(data.health, p.health, 0, 100);
+    p.shield = number(data.shield, p.shield, 0, 100);
+    p.alive = data.alive !== false && p.health > 0;
+
+    emitState(room);
+  });
+
+  socket.on("leaveRoom", () => leaveRoom(socket));
+  socket.on("disconnect", () => leaveRoom(socket));
+});
+
+// Shared bot movement, attacks, and storm simulation.
 setInterval(() => {
+  const now = Date.now();
+
   for (const room of rooms.values()) {
-    const livingPlayers = Array.from(room.players.values()).filter(p => p.alive);
-    if (livingPlayers.length === 0) continue;
+    const dt = Math.min(
+      0.2,
+      (now - room.lastTick) / 1000
+    );
+
+    room.lastTick = now;
+
+    const living = [...room.players.values()]
+      .filter(p => p.alive);
+
+    if (!living.length) continue;
+
+    room.stormTime += dt;
+
+    if (room.stormTime > 15) {
+      room.stormRadius = Math.max(
+        25,
+        room.stormRadius - dt * 0.8
+      );
+    }
 
     for (const bot of room.bots) {
       if (!bot.alive) continue;
 
-      let target = livingPlayers[0];
-      let bestDistance = Infinity;
-      for (const player of livingPlayers) {
-        const d = Math.hypot(player.x - bot.x, player.z - bot.z);
-        if (d < bestDistance) {
-          bestDistance = d;
-          target = player;
+      let target = null;
+      let best = Infinity;
+
+      for (const p of living) {
+        const d = Math.hypot(
+          p.x - bot.x,
+          p.z - bot.z
+        );
+
+        if (d < best) {
+          best = d;
+          target = p;
         }
       }
 
-      if (bestDistance > 4) {
+      if (!target) continue;
+
+      if (best > 4) {
         const dx = target.x - bot.x;
         const dz = target.z - bot.z;
-        const length = Math.hypot(dx, dz) || 1;
-        const speed = 1.6;
-        bot.x += (dx / length) * speed * 0.1;
-        bot.z += (dz / length) * speed * 0.1;
+        const len = Math.hypot(dx, dz) || 1;
+
+        bot.x += dx / len * 1.6 * dt;
+        bot.z += dz / len * 1.6 * dt;
+      }
+
+      bot.fire -= dt;
+
+      if (best < 65 && bot.fire <= 0) {
+        applyDamage(target, 10);
+        bot.fire = 1.5 + Math.random() * 1.5;
+      }
+
+      if (Math.hypot(bot.x, bot.z) > room.stormRadius) {
+        bot.health -= dt * 2;
+
+        if (bot.health <= 0) {
+          bot.health = 0;
+          bot.alive = false;
+        }
       }
     }
 
-    emitRoomState(room);
+    for (const p of room.players.values()) {
+      if (
+        p.alive &&
+        Math.hypot(p.x, p.z) > room.stormRadius
+      ) {
+        p._stormDamage = (p._stormDamage || 0) + dt;
+
+        if (p._stormDamage >= 2) {
+          applyDamage(p, 5);
+          p._stormDamage = 0;
+        }
+      } else {
+        p._stormDamage = 0;
+      }
+    }
+
+    emitState(room);
   }
 }, 100);
 
-const server = httpServer.listen(PORT, () => {
-  console.log(`Battle Royale multiplayer server listening on port ${PORT}`);
-});
+const server = httpServer.listen(PORT, () =>
+  console.log(
+    `Battle Royale multiplayer server listening on port ${PORT}`
+  )
+);
 
-// Render sends SIGTERM when stopping/restarting a service.
-process.on("SIGTERM", () => {
-  server.close(() => process.exit(0));
-});
+process.on("SIGTERM", () =>
+  server.close(() => process.exit(0))
+);
