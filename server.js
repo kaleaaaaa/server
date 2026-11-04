@@ -1,4 +1,3 @@
-
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -12,7 +11,7 @@ const io = new Server(httpServer, {
 
 const PORT = process.env.PORT || 3000;
 const rooms = new Map();
-const MAX_PLAYERS = 2;
+const MAX_PLAYERS = 4;
 
 app.get("/", (_req, res) =>
   res.type("text").send("Battle Royale multiplayer server is online.")
@@ -60,6 +59,8 @@ function makeRoom(code) {
   return {
     code,
     players: new Map(),
+    hostId: null,
+    phase: "lobby",
     bots: makeBots(),
     chests: [],
     worldReady: false,
@@ -74,6 +75,9 @@ function makeRoom(code) {
 function stateOf(room) {
   return {
     roomCode: room.code,
+    hostId: room.hostId,
+    phase: room.phase,
+    maxPlayers: MAX_PLAYERS,
     players: [...room.players.values()].map(p => ({
       id: p.id,
       name: p.name,
@@ -154,6 +158,7 @@ io.on("connection", socket => {
     const code = makeRoomCode();
     const room = makeRoom(code);
 
+    room.hostId = socket.id;
     room.players.set(socket.id, {
       id: socket.id,
       name: cleanName(payload.name),
@@ -180,7 +185,9 @@ io.on("connection", socket => {
       ok: true,
       roomCode: code,
       playerId: socket.id,
-      spawnX: 0
+      spawnX: 0,
+      spawnZ: 0,
+      isHost: true
     });
 
     emitState(room);
@@ -202,19 +209,32 @@ io.on("connection", socket => {
       });
     }
 
+    if (room.phase !== "lobby") {
+      return cb({ ok: false, error: "That match has already started." });
+    }
+
     if (room.players.size >= MAX_PLAYERS) {
       return cb({
         ok: false,
-        error: "That room is full (2 players maximum)."
+        error: "That squad is full (4 players maximum)."
       });
     }
+
+    const spawnPoints = [
+      { x: -8, z: 0 },
+      { x: 8, z: 0 },
+      { x: 0, z: -8 },
+      { x: 0, z: 8 }
+    ];
+
+    const spawn = spawnPoints[room.players.size] || { x: 0, z: 0 };
 
     room.players.set(socket.id, {
       id: socket.id,
       name: cleanName(payload.name),
-      x: 4,
+      x: spawn.x,
       y: 0,
-      z: 0,
+      z: spawn.z,
       yaw: 0,
       pitch: 0,
       health: 100,
@@ -234,10 +254,66 @@ io.on("connection", socket => {
       ok: true,
       roomCode: code,
       playerId: socket.id,
-      spawnX: 4
+      spawnX: spawn.x,
+      spawnZ: spawn.z,
+      isHost: socket.id === room.hostId
     });
 
     emitState(room);
+  });
+
+  socket.on("startMatch", (_data = {}, cb = () => {}) => {
+    const room = getRoom(socket);
+
+    if (!room) {
+      return cb({ ok: false, error: "Join a room first." });
+    }
+
+    if (socket.id !== room.hostId) {
+      return cb({
+        ok: false,
+        error: "Only the squad host can start the match."
+      });
+    }
+
+    if (room.phase !== "lobby") {
+      return cb({
+        ok: false,
+        error: "The match is already starting."
+      });
+    }
+
+    room.phase = "countdown";
+    room.startAt = Date.now() + 5000;
+
+    io.to(room.code).emit("matchStarting", {
+      startAt: room.startAt,
+      players: room.players.size
+    });
+
+    emitState(room);
+    cb({ ok: true });
+
+    const scheduledStart = room.startAt;
+
+    setTimeout(() => {
+      const current = rooms.get(room.code);
+
+      if (
+        !current ||
+        current.phase !== "countdown" ||
+        current.startAt !== scheduledStart
+      ) return;
+
+      current.phase = "playing";
+
+      io.to(current.code).emit("matchStarted", {
+        startAt: scheduledStart,
+        players: current.players.size
+      });
+
+      emitState(current);
+    }, 5000);
   });
 
   socket.on("playerUpdate", data => {
