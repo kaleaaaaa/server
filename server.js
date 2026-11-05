@@ -170,16 +170,25 @@ function number(v, fallback = 0, min = -260, max = 260) {
 }
 
 function makeBots(mode = "squad") {
-  if (mode === "1v1" || mode === "ffa") return [];
-  return Array.from({ length: 10 }, (_, i) => ({
-    id: `bot-${i + 1}`,
-    x: Math.random() * 200 - 100,
-    z: Math.random() * 200 - 100,
-    health: 100,
-    shield: 25,
-    alive: true,
-    fire: 1 + Math.random() * 2
-  }));
+  if (mode === "1v1" || mode === "ffa") {
+    return [];
+  }
+
+  const bots = [];
+
+  for (let i = 0; i < 10; i++) {
+    bots.push({
+      id: "bot-" + (i + 1),
+      x: Math.random() * 200 - 100,
+      z: Math.random() * 200 - 100,
+      health: 100,
+      shield: 25,
+      alive: true,
+      fire: 1 + Math.random() * 2
+    });
+  }
+
+  return bots;
 }
 
 function makeRoom(code, payload = {}) {
