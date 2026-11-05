@@ -1,3 +1,4 @@
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -88,6 +89,7 @@ function stateOf(room) {
     outcome: room.outcome,
     hostId: room.hostId,
     phase: room.phase,
+    maxPlayers: room.maxPlayers,
     players: [...room.players.values()].map(p => ({
       id: p.id,
       name: p.name,
@@ -117,46 +119,58 @@ function emitState(room) {
   io.to(room.code).emit("roomState", stateOf(room));
   broadcastServerList();
 }
-
 function publicServerList() {
   return [...rooms.values()].map(room => ({
-    id: room.code,
-    name: room.serverName,
-    mode: room.mode,
-    players: room.players.size,
-    maxPlayers: room.maxPlayers,
-    phase: room.phase
+    id: room.code, name: room.serverName, mode: room.mode,
+    players: room.players.size, maxPlayers: room.maxPlayers, phase: room.phase
   }));
 }
+function broadcastServerList() { io.emit("serverList", publicServerList()); }
 
-function broadcastServerList() {
-  io.emit("serverList", publicServerList());
+function shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz) {
+  // Test the complete shot segment against each oriented player-built object.
+  for (const structure of room.structures) {
+    const yaw = Number(structure.yaw) || 0;
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const toLocal = (x, z) => {
+      const dx = x - structure.x, dz = z - structure.z;
+      return { x: dx * c - dz * s, z: dx * s + dz * c };
+    };
+    const a = toLocal(ox, oz), b = toLocal(tx, tz);
+    const dx = b.x - a.x, dz = b.z - a.z, dy = ty - oy;
+    const halfW = structure.type === "ramp" ? 2.6 : 3.05;
+    const halfD = structure.type === "ramp" ? 3.4 : 0.30;
+    let tMin = 0, tMax = 1;
+    for (const [origin, delta, half] of [[a.x, dx, halfW], [a.z, dz, halfD]]) {
+      if (Math.abs(delta) < 1e-8) {
+        if (origin < -half || origin > half) { tMin = 2; break; }
+      } else {
+        let t1 = (-half - origin) / delta, t2 = (half - origin) / delta;
+        if (t1 > t2) [t1, t2] = [t2, t1];
+        tMin = Math.max(tMin, t1);
+        tMax = Math.min(tMax, t2);
+        if (tMin > tMax) break;
+      }
+    }
+    if (tMin >= 0 && tMin <= tMax && tMin <= 1) {
+      const hitY = oy + dy * tMin;
+      const top = structure.type === "ramp" ? 3.6 : 3.8;
+      if (hitY >= -0.1 && hitY <= top) return true;
+    }
+  }
+  return false;
 }
 
 function checkOutcome(room) {
   if (!room || room.outcome || room.phase !== "playing") return;
-
   const living = [...room.players.values()].filter(p => p.alive);
-
   if (room.mode === "1v1") {
     const winner = [...room.players.values()].find(p => (p.score || 0) >= 10);
-
-    if (winner) {
-      room.outcome = {
-        winner: "player",
-        winnerId: winner.id,
-        score: winner.score,
-        targetScore: 10
-      };
-    }
+    if (winner) room.outcome = { winner: "player", winnerId: winner.id, score: winner.score, targetScore: 10 };
   } else {
-    if (living.length === 0) {
-      room.outcome = { winner: "bots" };
-    } else if (room.bots.every(b => !b.alive)) {
-      room.outcome = { winner: "squad" };
-    }
+    if (living.length === 0) room.outcome = { winner: "bots" };
+    else if (room.bots.every(b => !b.alive)) room.outcome = { winner: "squad" };
   }
-
   if (room.outcome) {
     io.to(room.code).emit("matchEnded", room.outcome);
     emitState(room);
@@ -180,18 +194,9 @@ function leaveRoom(socket) {
   if (!room) return;
 
   room.players.delete(socket.id);
-
-  if (room.hostId === socket.id) {
-    room.hostId = room.players.keys().next().value || null;
-  }
-
-  if (!room.players.size) {
-    rooms.delete(code);
-    broadcastServerList();
-  } else {
-    checkOutcome(room);
-    emitState(room);
-  }
+  if (room.hostId === socket.id) room.hostId = room.players.keys().next().value || null;
+  if (!room.players.size) { rooms.delete(code); broadcastServerList(); }
+  else { checkOutcome(room); emitState(room); }
 }
 
 function applyDamage(player, amount) {
@@ -209,6 +214,10 @@ function applyDamage(player, amount) {
   }
 }
 
+function playerById(room, id) {
+  return room.players.get(id);
+}
+
 io.on("connection", socket => {
 
   socket.on("createRoom", (payload = {}, cb = () => {}) => {
@@ -218,8 +227,7 @@ io.on("connection", socket => {
     const room = makeRoom(code, payload);
 
     room.hostId = socket.id;
-
-    room.players.set(socket.id, {
+     room.players.set(socket.id, {
       id: socket.id,
       name: cleanName(payload.name),
       x: 0,
@@ -273,10 +281,7 @@ io.on("connection", socket => {
     }
 
     if (room.phase !== "lobby") {
-      return cb({
-        ok: false,
-        error: "That match has already started."
-      });
+      return cb({ ok: false, error: "That match has already started." });
     }
 
     if (room.players.size >= room.maxPlayers) {
@@ -287,14 +292,9 @@ io.on("connection", socket => {
     }
 
     const spawnPoints = [
-      { x: -8, z: 0 },
-      { x: 8, z: 0 },
-      { x: 0, z: -8 },
-      { x: 0, z: 8 }
+      { x: -8, z: 0 }, { x: 8, z: 0 }, { x: 0, z: -8 }, { x: 0, z: 8 }
     ];
-
     const spawn = spawnPoints[room.players.size] || { x: 0, z: 0 };
-
     room.players.set(socket.id, {
       id: socket.id,
       name: cleanName(payload.name),
@@ -333,62 +333,35 @@ io.on("connection", socket => {
 
   socket.on("startMatch", (_data = {}, cb = () => {}) => {
     const room = getRoom(socket);
-
-    if (!room) {
-      return cb({ ok: false, error: "Join a room first." });
-    }
-
+    if (!room) return cb({ ok: false, error: "Join a room first." });
     if (socket.id !== room.hostId) {
-      return cb({
-        ok: false,
-        error: "Only the squad host can start the match."
-      });
+      return cb({ ok: false, error: "Only the squad host can start the match." });
     }
-
     if (room.phase !== "lobby") {
-      return cb({
-        ok: false,
-        error: "The match is already starting."
-      });
+      return cb({ ok: false, error: "The match is already starting." });
     }
 
-    if (room.mode === "1v1" && room.players.size !== 2) {
-      return cb({
-        ok: false,
-        error: "A 1v1 match needs two players."
-      });
-    }
-
+    if (room.mode === "1v1" && room.players.size !== 2) return cb({ ok: false, error: "A 1v1 match needs two players." });
     room.phase = "countdown";
     room.outcome = null;
     room.startAt = Date.now() + 5000;
-
     io.to(room.code).emit("matchStarting", {
       startAt: room.startAt,
       players: room.players.size
     });
-
     emitState(room);
     cb({ ok: true });
 
     const scheduledStart = room.startAt;
-
     setTimeout(() => {
       const current = rooms.get(room.code);
-
-      if (
-        !current ||
-        current.phase !== "countdown" ||
-        current.startAt !== scheduledStart
-      ) return;
-
+      if (!current || current.phase !== "countdown" ||
+          current.startAt !== scheduledStart) return;
       current.phase = "playing";
-
       io.to(current.code).emit("matchStarted", {
         startAt: scheduledStart,
         players: current.players.size
       });
-
       emitState(current);
     }, 5000);
   });
@@ -470,14 +443,13 @@ io.on("connection", socket => {
       );
 
       if (dist < 1.25) {
+        // A built wall/ramp between the muzzle and target absorbs the shot.
+        if (shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz)) break;
         applyDamage(target, 25);
 
         if (!target.alive) {
           shooter.kills++;
-
-          if (room.mode === "1v1") {
-            shooter.score = (shooter.score || 0) + 1;
-          }
+          if (room.mode === "1v1") shooter.score = (shooter.score || 0) + 1;
         }
 
         checkOutcome(room);
@@ -485,22 +457,11 @@ io.on("connection", socket => {
 
         if (room.mode === "1v1" && !room.outcome && !target.alive) {
           const targetId = target.id;
-
-          const spawn = targetId === room.hostId
-            ? { x: 0, z: 0 }
-            : { x: 8, z: 0 };
-
+          const spawn = targetId === room.hostId ? { x: 0, z: 0 } : { x: 8, z: 0 };
           setTimeout(() => {
             const current = rooms.get(room.code);
             const respawning = current?.players.get(targetId);
-
-            if (
-              !current ||
-              current.outcome ||
-              current.phase !== "playing" ||
-              !respawning
-            ) return;
-
+            if (!current || current.outcome || current.phase !== "playing" || !respawning) return;
             respawning.health = 100;
             respawning.shield = 100;
             respawning.alive = true;
@@ -508,17 +469,10 @@ io.on("connection", socket => {
             respawning.y = 0;
             respawning.z = spawn.z;
             respawning.yaw = targetId === current.hostId ? 0 : Math.PI;
-
-            io.to(targetId).emit("playerRespawned", {
-              id: targetId,
-              x: spawn.x,
-              z: spawn.z
-            });
-
+            io.to(targetId).emit("playerRespawned", { id: targetId, x: spawn.x, z: spawn.z });
             emitState(current);
           }, 1400);
         }
-
         break;
       }
     }
@@ -701,9 +655,7 @@ io.on("connection", socket => {
     emitState(room);
   });
 
-  socket.on("requestServerList", () =>
-    socket.emit("serverList", publicServerList())
-  );
+  socket.on("requestServerList", () => socket.emit("serverList", publicServerList()));
 
   socket.on("leaveRoom", () => leaveRoom(socket));
   socket.on("disconnect", () => leaveRoom(socket));
@@ -767,43 +719,12 @@ setInterval(() => {
       bot.fire -= dt;
 
       if (best < 65 && bot.fire <= 0) {
-        const ox = bot.x;
-        const oy = 1.5;
-        const oz = bot.z;
-
-        const tx = target.x;
-        const ty = target.y + 1.2;
-        const tz = target.z;
-
-        const len = Math.hypot(
-          tx - ox,
-          ty - oy,
-          tz - oz
-        ) || 1;
-
-        const direction = {
-          x: (tx - ox) / len,
-          y: (ty - oy) / len,
-          z: (tz - oz) / len
-        };
-
-        room.botProjectiles.push({
-          x: ox,
-          y: oy,
-          z: oz,
-          vx: direction.x * 42,
-          vy: direction.y * 42,
-          vz: direction.z * 42,
-          life: 3,
-          targetId: target.id
-        });
-
-        io.to(room.code).emit("botProjectile", {
-          origin: { x: ox, y: oy, z: oz },
-          direction,
-          speed: 42
-        });
-
+        const ox = bot.x, oy = 1.5, oz = bot.z;
+        const tx = target.x, ty = target.y + 1.2, tz = target.z;
+        const len = Math.hypot(tx-ox, ty-oy, tz-oz) || 1;
+        const direction = { x:(tx-ox)/len, y:(ty-oy)/len, z:(tz-oz)/len };
+        room.botProjectiles.push({ x:ox, y:oy, z:oz, vx:direction.x*42, vy:direction.y*42, vz:direction.z*42, life:3, targetId:target.id });
+        io.to(room.code).emit("botProjectile", { origin:{x:ox,y:oy,z:oz}, direction, speed:42 });
         bot.fire = 1.5 + Math.random() * 1.5;
       }
 
@@ -819,28 +740,14 @@ setInterval(() => {
 
     for (let i = room.botProjectiles.length - 1; i >= 0; i--) {
       const b = room.botProjectiles[i];
-
-      b.x += b.vx * dt;
-      b.y += b.vy * dt;
-      b.z += b.vz * dt;
-      b.life -= dt;
-
+      const old = { x:b.x, y:b.y, z:b.z };
+      b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt; b.life -= dt;
       const target = room.players.get(b.targetId);
-
       if (target && target.alive) {
-        const dx = target.x - b.x;
-        const dy = (target.y + 1.2) - b.y;
-        const dz = target.z - b.z;
-
-        if (Math.hypot(dx, dy, dz) < 1.25) {
-          applyDamage(target, 10);
-          b.life = 0;
-        }
+        const dx=target.x-b.x, dy=(target.y+1.2)-b.y, dz=target.z-b.z;
+        if (Math.hypot(dx,dy,dz) < 1.25) { applyDamage(target,10); b.life=0; }
       }
-
-      if (b.life <= 0) {
-        room.botProjectiles.splice(i, 1);
-      }
+      if (b.life <= 0) room.botProjectiles.splice(i,1);
     }
 
     for (const p of room.players.values()) {
