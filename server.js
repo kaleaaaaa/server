@@ -23,6 +23,12 @@ const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
 if (!supabase) console.warn("Supabase is not configured. Player progression saving is disabled until SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set.");
 
 const XP_PER_LEVEL = 500;
+const SHOP_ITEMS = {
+  skin_crimson: { price: 300, category: "skin" },
+  skin_arctic: { price: 600, category: "skin" },
+  cosmetic_scout: { price: 800, category: "cosmetic" },
+  title_champion: { price: 500, category: "title" }
+};
 const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "default", cosmetic: "default", title: "" };
 
 function normalizeLoadout(value) {
@@ -30,9 +36,9 @@ function normalizeLoadout(value) {
   return {
     primary: ["assault_rifle", "smg"].includes(v.primary) ? v.primary : "assault_rifle",
     secondary: ["pistol", "smg"].includes(v.secondary) ? v.secondary : null,
-    skin: ["default", "neon", "abyss"].includes(v.skin) ? v.skin : "default",
-    cosmetic: ["default", "urban_camo", "elite_armor"].includes(v.cosmetic) ? v.cosmetic : "default",
-    title: ["", "veteran", "legend"].includes(v.title) ? v.title : ""
+    skin: ["default", "neon", "abyss", "crimson", "arctic"].includes(v.skin) ? v.skin : "default",
+    cosmetic: ["default", "urban_camo", "elite_armor", "scout"].includes(v.cosmetic) ? v.cosmetic : "default",
+    title: ["", "veteran", "legend", "champion"].includes(v.title) ? v.title : ""
   };
 }
 
@@ -48,6 +54,16 @@ function loadoutForLevel(value, level) {
   if (level < 5 && v.title === "veteran") v.title = "";
   if (level < 150 && v.title === "legend") v.title = level >= 5 ? "veteran" : "";
   return v;
+}
+
+function loadoutForProfile(value, level, ownedItems = []) {
+  const loadout = loadoutForLevel(value, level);
+  const owned = new Set(Array.isArray(ownedItems) ? ownedItems : []);
+  if (loadout.skin === "crimson" && !owned.has("skin_crimson")) loadout.skin = "default";
+  if (loadout.skin === "arctic" && !owned.has("skin_arctic")) loadout.skin = "default";
+  if (loadout.cosmetic === "scout" && !owned.has("cosmetic_scout")) loadout.cosmetic = "default";
+  if (loadout.title === "champion" && !owned.has("title_champion")) loadout.title = "";
+  return loadout;
 }
 
 function profileNameKey(value) {
@@ -66,7 +82,9 @@ function profileView(row, fallbackName = "Player") {
     kills: Number(row?.total_kills) || 0,
     wins: Number(row?.total_wins) || 0,
     matches: Number(row?.matches_played) || 0,
-    equippedLoadout: loadoutForLevel(row?.equipped_loadout, level)
+    coins: Math.max(0, Number(row?.coins) || 0),
+    ownedItems: Array.isArray(row?.owned_items) ? row.owned_items : [],
+    equippedLoadout: loadoutForProfile(row?.equipped_loadout, level, row?.owned_items)
   };
 }
 
@@ -75,7 +93,7 @@ async function loadPlayerProfile(name) {
   const displayName = cleanName(name);
   const { data, error } = await supabase
     .from("player_profiles")
-    .select("display_name,total_xp,total_kills,total_wins,matches_played,equipped_loadout")
+    .select("display_name,total_xp,total_kills,total_wins,matches_played,equipped_loadout,coins,owned_items")
     .eq("name_key", profileNameKey(displayName))
     .maybeSingle();
   if (error) throw error;
@@ -90,6 +108,7 @@ async function awardMatchProgress(room) {
       ? room.outcome?.winner === "player" && room.outcome.winnerId === player.id
       : room.outcome?.winner === "squad";
     const earnedXp = Math.max(0, Number(player.matchXp) || 0) + 100 + (won ? 500 : 0);
+    const earnedCoins = Math.max(0, Number(player.matchKills) || 0) * 25 + 50 + (won ? 100 : 0);
     try {
       const { data, error } = await supabase.rpc("award_player_progress", {
         p_name_key: profileNameKey(player.name),
@@ -97,14 +116,15 @@ async function awardMatchProgress(room) {
         p_xp: earnedXp,
         p_kills: Math.max(0, Number(player.matchKills) || 0),
         p_wins: won ? 1 : 0,
-        p_matches: 1
+        p_matches: 1,
+        p_coins: earnedCoins
       });
       if (error) throw error;
       const row = Array.isArray(data) ? data[0] : data;
       const updatedProfile = profileView(row, player.name);
       const previousLevel = Math.max(1, Math.floor(Math.max(0, updatedProfile.totalXp - earnedXp) / XP_PER_LEVEL) + 1);
       io.to(player.id).emit("profileUpdated", {
-        ...updatedProfile, previousLevel, earnedXp, won
+        ...updatedProfile, previousLevel, earnedXp, earnedCoins, won
       });
     } catch (error) {
       console.error("Could not save progression for", player.name, error.message);
@@ -116,6 +136,7 @@ async function awardMatchProgress(room) {
 async function awardFFAPlayerKill(player) {
   if (!supabase || !player) return;
   const earnedXp = 100;
+  const earnedCoins = 25;
   try {
     const { data, error } = await supabase.rpc("award_player_progress", {
       p_name_key: profileNameKey(player.name),
@@ -123,14 +144,15 @@ async function awardFFAPlayerKill(player) {
       p_xp: earnedXp,
       p_kills: 1,
       p_wins: 0,
-      p_matches: 0
+      p_matches: 0,
+      p_coins: earnedCoins
     });
     if (error) throw error;
     const row = Array.isArray(data) ? data[0] : data;
     const updatedProfile = profileView(row, player.name);
     const previousLevel = Math.max(1, Math.floor(Math.max(0, updatedProfile.totalXp - earnedXp) / XP_PER_LEVEL) + 1);
     io.to(player.id).emit("profileUpdated", {
-      ...updatedProfile, previousLevel, earnedXp, won: false
+      ...updatedProfile, previousLevel, earnedXp, earnedCoins, won: false
     });
   } catch (error) {
     console.error("Could not save Free For All kill for", player.name, error.message);
@@ -371,7 +393,6 @@ function applyDamage(player, amount) {
 function playerById(room, id) {
   return room.players.get(id);
 }
-
 io.on("connection", socket => {
 
   socket.on("getProfile", async (payload = {}, cb = () => {}) => {
@@ -393,17 +414,19 @@ io.on("connection", socket => {
       const { error: seedError } = await supabase.from("player_profiles").upsert({
         name_key: profileNameKey(name), display_name: name,
         total_xp: 0, total_kills: 0, total_wins: 0, matches_played: 0,
-        equipped_loadout: DEFAULT_LOADOUT
+        equipped_loadout: DEFAULT_LOADOUT,
+        coins: 0,
+        owned_items: []
       }, { onConflict: "name_key", ignoreDuplicates: true });
       if (seedError) throw seedError;
 
       const { data: row, error: readError } = await supabase.from("player_profiles")
-        .select("total_xp,equipped_loadout").eq("name_key", profileNameKey(name)).maybeSingle();
+        .select("total_xp,equipped_loadout,owned_items").eq("name_key", profileNameKey(name)).maybeSingle();
       if (readError) throw readError;
       if (!row) return cb({ ok: false, error: "Play and earn progression first to create your saved profile." });
 
       const level = Math.floor(Math.max(0, Number(row.total_xp) || 0) / XP_PER_LEVEL) + 1;
-      const loadout = loadoutForLevel(payload.loadout, level);
+      const loadout = loadoutForProfile(payload.loadout, level, row?.owned_items);
       const { error: saveError } = await supabase.from("player_profiles")
         .update({ equipped_loadout: loadout, updated_at: new Date().toISOString() })
         .eq("name_key", profileNameKey(name));
@@ -422,6 +445,53 @@ io.on("connection", socket => {
     }
   });
 
+  socket.on("purchaseShopItem", async (payload = {}, cb = () => {}) => {
+    if (!supabase) return cb({ ok: false, error: "Coin purchases need the Supabase coin migration." });
+
+    const name = cleanName(payload.name);
+    const itemId = String(payload.itemId || "");
+    if (!SHOP_ITEMS[itemId]) {
+      return cb({ ok: false, error: "That shop item does not exist." });
+    }
+
+    try {
+      const { data, error } = await supabase.rpc("purchase_player_item", {
+        p_name_key: profileNameKey(name),
+        p_display_name: name,
+        p_item_id: itemId
+      });
+      if (error) throw error;
+
+      const result = Array.isArray(data) ? data[0] : data;
+      if (result?.already_owned) {
+        return cb({
+          ok: false,
+          error: "You already own this item.",
+          coins: Number(result.coins) || 0,
+          ownedItems: Array.isArray(result.owned_items) ? result.owned_items : []
+        });
+      }
+
+      const updated = await loadPlayerProfile(name);
+      cb({
+        ok: true,
+        coins: updated.profile.coins,
+        ownedItems: updated.profile.ownedItems,
+        profile: updated.profile
+      });
+      socket.emit("profileUpdated", updated.profile);
+    } catch (error) {
+      const message = String(error?.message || "");
+      console.error("Shop purchase failed for", name, message);
+      cb({
+        ok: false,
+        error: message.toLowerCase().includes("not enough")
+          ? "Not enough coins for this item."
+          : "Purchase failed. Check the Supabase coin migration and try again."
+      });
+    }
+  });
+
   socket.on("setPlayerLoadout", async (payload = {}, cb = () => {}) => {
     const room = getRoom(socket);
     const player = room?.players.get(socket.id);
@@ -429,10 +499,10 @@ io.on("connection", socket => {
 
     try {
       const { data: row, error } = await supabase.from("player_profiles")
-        .select("total_xp,equipped_loadout").eq("name_key", profileNameKey(player.name)).maybeSingle();
+        .select("total_xp,equipped_loadout,owned_items").eq("name_key", profileNameKey(player.name)).maybeSingle();
       if (error) throw error;
       const level = Math.floor(Math.max(0, Number(row?.total_xp) || 0) / XP_PER_LEVEL) + 1;
-      player.equippedLoadout = loadoutForLevel(row?.equipped_loadout, level);
+      player.equippedLoadout = loadoutForProfile(row?.equipped_loadout, level, row?.owned_items);
       emitState(room);
       cb?.({ ok: true });
     } catch (error) {
@@ -600,8 +670,7 @@ io.on("connection", socket => {
       emitState(current);
     }, 5000);
   });
-
-  socket.on("playerUpdate", data => {
+    socket.on("playerUpdate", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
 
@@ -777,6 +846,9 @@ io.on("connection", socket => {
   socket.on("openChest", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
+      socket.on("openChest", data => {
+    const room = getRoom(socket);
+    const p = room?.players.get(socket.id);
     if (!room || !p || !p.alive) return;
 
     const chest = room.chests[Number(data.index)];
@@ -872,7 +944,7 @@ io.on("connection", socket => {
 });
 
 // Shared bot movement, attacks, and storm simulation.
-setInterval(() => {
+      setInterval(() => {
   const now = Date.now();
 
   for (const room of rooms.values()) {
