@@ -128,34 +128,39 @@ function publicServerList() {
 function broadcastServerList() { io.emit("serverList", publicServerList()); }
 
 function shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz) {
-  // Test the complete shot segment against each oriented player-built object.
-  for (const structure of room.structures) {
-    const yaw = Number(structure.yaw) || 0;
-    const c = Math.cos(yaw), s = Math.sin(yaw);
-    const toLocal = (x, z) => {
-      const dx = x - structure.x, dz = z - structure.z;
-      return { x: dx * c - dz * s, z: dx * s + dz * c };
-    };
-    const a = toLocal(ox, oz), b = toLocal(tx, tz);
-    const dx = b.x - a.x, dz = b.z - a.z, dy = ty - oy;
-    const halfW = structure.type === "ramp" ? 2.6 : 3.05;
-    const halfD = structure.type === "ramp" ? 3.4 : 0.30;
-    let tMin = 0, tMax = 1;
-    for (const [origin, delta, half] of [[a.x, dx, halfW], [a.z, dz, halfD]]) {
-      if (Math.abs(delta) < 1e-8) {
-        if (origin < -half || origin > half) { tMin = 2; break; }
-      } else {
-        let t1 = (-half - origin) / delta, t2 = (half - origin) / delta;
-        if (t1 > t2) [t1, t2] = [t2, t1];
-        tMin = Math.max(tMin, t1);
-        tMax = Math.min(tMax, t2);
-        if (tMin > tMax) break;
+  const segmentHitsBox = (a, b, half) => {
+    const d = { x:b.x-a.x, y:b.y-a.y, z:b.z-a.z };
+    let lo = 0, hi = 1;
+    for (const [o,v,h] of [[a.x,d.x,half.x],[a.y,d.y,half.y],[a.z,d.z,half.z]]) {
+      if (Math.abs(v) < 1e-8) { if (o < -h || o > h) return false; }
+      else {
+        let t1=(-h-o)/v, t2=(h-o)/v;
+        if (t1>t2) [t1,t2]=[t2,t1];
+        lo=Math.max(lo,t1); hi=Math.min(hi,t2);
+        if (lo>hi) return false;
       }
     }
-    if (tMin >= 0 && tMin <= tMax && tMin <= 1) {
-      const hitY = oy + dy * tMin;
-      const top = structure.type === "ramp" ? 3.6 : 3.8;
-      if (hitY >= -0.1 && hitY <= top) return true;
+    return lo >= 0 && lo <= 1 && hi >= lo;
+  };
+  for (const structure of room.structures) {
+    const yaw = Number(structure.yaw) || 0;
+    const c=Math.cos(yaw), s=Math.sin(yaw);
+    const wallLocal = (p) => {
+      const dx=p.x-structure.x, dz=p.z-structure.z;
+      return { x:dx*c-dz*s, y:p.y-1.8, z:dx*s+dz*c };
+    };
+    const rampLocal = (p) => {
+      const dx=p.x-structure.x, dz=p.z-structure.z;
+      const x=dx*c-dz*s, worldZ=dx*s+dz*c;
+      const y=p.y-1.4, z=worldZ+3.25;
+      const slope=Math.atan2(2.8,6.5);
+      return { x, y:y*Math.cos(slope)+z*Math.sin(slope), z:-y*Math.sin(slope)+z*Math.cos(slope) };
+    };
+    const a={x:ox,y:oy,z:oz}, b={x:tx,y:ty,z:tz};
+    if (structure.type === "ramp") {
+      if (segmentHitsBox(rampLocal(a),rampLocal(b),{x:2.5,y:0.16,z:Math.hypot(6.5,2.8)/2})) return true;
+    } else {
+      if (segmentHitsBox(wallLocal(a),wallLocal(b),{x:3,y:1.8,z:0.2})) return true;
     }
   }
   return false;
@@ -742,8 +747,11 @@ setInterval(() => {
       const b = room.botProjectiles[i];
       const old = { x:b.x, y:b.y, z:b.z };
       b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt; b.life -= dt;
+      if (shotBlockedByBuild(room, old.x, old.y, old.z, b.x, b.y, b.z)) {
+        b.life = 0;
+      }
       const target = room.players.get(b.targetId);
-      if (target && target.alive) {
+      if (b.life > 0 && target && target.alive) {
         const dx=target.x-b.x, dy=(target.y+1.2)-b.y, dz=target.z-b.z;
         if (Math.hypot(dx,dy,dz) < 1.25) { applyDamage(target,10); b.life=0; }
       }
