@@ -53,7 +53,7 @@ async function loadPlayerProfile(name) {
 }
 
 async function awardMatchProgress(room) {
-  if (!supabase || !room || room.progressAwarded) return;
+  if (!supabase || !room || room.mode === "ffa" || room.progressAwarded) return;
   room.progressAwarded = true;
   await Promise.all([...room.players.values()].map(async player => {
     const won = room.mode === "1v1"
@@ -79,6 +79,29 @@ async function awardMatchProgress(room) {
       io.to(player.id).emit("gameNotice", { message: "Progress could not be saved. Check the server's Supabase settings." });
     }
   }));
+}
+
+async function awardFFAPlayerKill(player) {
+  if (!supabase || !player) return;
+  const earnedXp = 100;
+  try {
+    const { data, error } = await supabase.rpc("award_player_progress", {
+      p_name_key: profileNameKey(player.name),
+      p_display_name: cleanName(player.name),
+      p_xp: earnedXp,
+      p_kills: 1,
+      p_wins: 0,
+      p_matches: 0
+    });
+    if (error) throw error;
+    const row = Array.isArray(data) ? data[0] : data;
+    io.to(player.id).emit("profileUpdated", {
+      ...profileView(row, player.name), earnedXp, won: false
+    });
+  } catch (error) {
+    console.error("Could not save Free For All kill for", player.name, error.message);
+    io.to(player.id).emit("gameNotice", { message: "Your Free For All kill could not be saved to progression." });
+  }
 }
 
 app.get("/", (_req, res) =>
@@ -112,7 +135,7 @@ function number(v, fallback = 0, min = -260, max = 260) {
 }
 
 function makeBots(mode = "squad") {
-  if (mode === "1v1") return [];
+  if (mode === "1v1" || mode === "ffa") return [];
   return Array.from({ length: 10 }, (_, i) => ({
     id: `bot-${i + 1}`,
     x: Math.random() * 200 - 100,
@@ -125,12 +148,12 @@ function makeBots(mode = "squad") {
 }
 
 function makeRoom(code, payload = {}) {
-  const mode = payload.mode === "1v1" ? "1v1" : "squad";
+  const mode = payload.mode === "1v1" ? "1v1" : payload.mode === "ffa" ? "ffa" : "squad";
   return {
     code,
     serverName: String(payload.serverName || "New Server").trim().slice(0, 28) || "New Server",
     mode,
-    maxPlayers: mode === "1v1" ? 2 : DEFAULT_MAX_PLAYERS,
+    maxPlayers: mode === "1v1" ? 2 : mode === "ffa" ? 10 : DEFAULT_MAX_PLAYERS,
     outcome: null,
     progressAwarded: false,
     players: new Map(),
@@ -214,7 +237,7 @@ function shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz) {
     const yaw = Number(structure.yaw) || 0;
     const c=Math.cos(yaw), s=Math.sin(yaw);
     const wallLocal = (p) => {
-      const dx=p.x-structure.x, dz=p.z-structure.z;
+            const dx=p.x-structure.x, dz=p.z-structure.z;
       return { x:dx*c-dz*s, y:p.y-1.8, z:dx*s+dz*c };
     };
     const rampLocal = (p) => {
@@ -235,9 +258,9 @@ function shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz) {
 }
 
 function checkOutcome(room) {
-  if (!room || room.outcome || room.phase !== "playing") return;
+  if (!room || room.mode === "ffa" || room.outcome || room.phase !== "playing") return;
   const living = [...room.players.values()].filter(p => p.alive);
-    if (room.mode === "1v1") {
+  if (room.mode === "1v1") {
     const winner = [...room.players.values()].find(p => (p.score || 0) >= 10);
     if (winner) room.outcome = { winner: "player", winnerId: winner.id, score: winner.score, targetScore: 10 };
   } else {
@@ -330,7 +353,7 @@ io.on("connection", socket => {
       matchKills: 0,
       matchXp: 0,
       score: 0,
-      materials: 100,
+      materials: room.mode === "ffa" ? 999 : 100,
       lastShot: 0
     });
 
@@ -380,7 +403,9 @@ io.on("connection", socket => {
     }
 
     const spawnPoints = [
-      { x: -8, z: 0 }, { x: 8, z: 0 }, { x: 0, z: -8 }, { x: 0, z: 8 }
+      { x: -8, z: 0 }, { x: 8, z: 0 }, { x: 0, z: -8 }, { x: 0, z: 8 },
+      { x: -12, z: -12 }, { x: 12, z: -12 }, { x: -12, z: 12 }, { x: 12, z: 12 },
+      { x: -18, z: 0 }, { x: 18, z: 0 }
     ];
     const spawn = spawnPoints[room.players.size] || { x: 0, z: 0 };
     room.players.set(socket.id, {
@@ -400,7 +425,7 @@ io.on("connection", socket => {
       matchKills: 0,
       matchXp: 0,
       score: 0,
-      materials: 100,
+      materials: room.mode === "ffa" ? 999 : 100,
       lastShot: 0
     });
 
@@ -452,7 +477,7 @@ io.on("connection", socket => {
       for (const player of current.players.values()) {
         player.matchXp = 0;
         player.matchKills = 0;
-      }
+              }
       io.to(current.code).emit("matchStarted", {
         startAt: scheduledStart,
         players: current.players.size
@@ -526,7 +551,7 @@ io.on("connection", socket => {
     });
 
     for (const target of room.players.values()) {
-      if (room.mode !== "1v1") break;
+      if (room.mode !== "1v1" && room.mode !== "ffa") break;
       if (target.id === shooter.id || !target.alive) continue;
 
       const tx = target.x;
@@ -556,15 +581,21 @@ io.on("connection", socket => {
           shooter.kills++;
           shooter.matchKills = (shooter.matchKills || 0) + 1;
           shooter.matchXp = (shooter.matchXp || 0) + 100;
-          if (room.mode === "1v1") shooter.score = (shooter.score || 0) + 1;
+          if (room.mode === "1v1" || room.mode === "ffa") shooter.score = (shooter.score || 0) + 1;
+          if (room.mode === "ffa") void awardFFAPlayerKill(shooter);
         }
 
         checkOutcome(room);
         emitState(room);
 
-        if (room.mode === "1v1" && !room.outcome && !target.alive) {
+        if ((room.mode === "1v1" || room.mode === "ffa") && !room.outcome && !target.alive) {
           const targetId = target.id;
-          const spawn = targetId === room.hostId ? { x: 0, z: 0 } : { x: 8, z: 0 };
+          const targetIndex = [...room.players.keys()].indexOf(targetId);
+          const ffaSpawns = [
+            { x: 0, z: 0 }, { x: -8, z: 0 }, { x: 8, z: 0 }, { x: 0, z: -8 }, { x: 0, z: 8 },
+            { x: -12, z: -12 }, { x: 12, z: -12 }, { x: -12, z: 12 }, { x: 12, z: 12 }, { x: 18, z: 0 }
+          ];
+          const spawn = room.mode === "ffa" ? (ffaSpawns[Math.max(0,targetIndex)] || {x:0,z:0}) : (targetId === room.hostId ? { x: 0, z: 0 } : { x: 8, z: 0 });
           setTimeout(() => {
             const current = rooms.get(room.code);
             const respawning = current?.players.get(targetId);
@@ -584,7 +615,8 @@ io.on("connection", socket => {
       }
     }
   });
-    socket.on("damageBot", data => {
+
+  socket.on("damageBot", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
 
@@ -685,7 +717,7 @@ io.on("connection", socket => {
       p.potions > 0 &&
       p.shield < 100
     ) {
-      p.potions--;
+            p.potions--;
       p.shield = Math.min(100, p.shield + 40);
     }
 
@@ -711,7 +743,7 @@ io.on("connection", socket => {
       yaw: number(data.yaw, p.yaw, -1000, 1000)
     };
 
-    p.materials -= 10;
+    p.materials = Math.max(0, p.materials - 10);
     room.structures.push(structure);
 
     if (room.structures.length > 100) {
@@ -785,6 +817,10 @@ setInterval(() => {
       .filter(p => p.alive);
 
     if (!living.length) continue;
+    if (room.mode === "ffa") {
+      emitState(room);
+      continue;
+    }
 
     room.stormTime += dt;
 
