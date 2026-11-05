@@ -425,6 +425,16 @@ io.on("connection", socket => {
     dy /= len;
     dz /= len;
 
+    // Send the visible projectile to the other players in this room.
+    // Damage remains handled by the existing authoritative server hit check below.
+    socket.to(room.code).emit("playerProjectile", {
+      shooterId: shooter.id,
+      shooterName: shooter.name,
+      origin: { x: ox, y: oy, z: oz },
+      direction: { x: dx, y: dy, z: dz },
+      speed: 85
+    });
+
     for (const target of room.players.values()) {
       if (room.mode !== "1v1") break;
       if (target.id === shooter.id || !target.alive) continue;
