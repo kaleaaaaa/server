@@ -820,7 +820,7 @@ io.on("connection", socket => {
 
     const type = data.type === "ramp" ? "ramp" : "wall";
     const structure = {
-      id: `${socket.id}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+      id: socket.id + "-" + Date.now() + "-" + Math.floor(Math.random() * 1e6),
       owner: socket.id,
       type,
       x: number(data.x, p.x),
@@ -981,7 +981,7 @@ setInterval(() => {
 }, 100);
 
 const server = httpServer.listen(PORT, () =>
-  console.log(`Battle Royale multiplayer server listening on port ${PORT}`)
+  console.log("Battle Royale multiplayer server listening on port " + PORT)
 );
 
 process.on("SIGTERM", () =>
