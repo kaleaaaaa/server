@@ -1,4 +1,3 @@
-
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -27,20 +26,68 @@ const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
 if (!supabase) console.warn("Supabase is not configured. Player progression saving is disabled until SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set.");
 
 const XP_PER_LEVEL = 500;
+const SHOP_ITEMS = {
+  skin_crimson: { price: 300, category: "skin" },
+  skin_arctic: { price: 600, category: "skin" },
+  cosmetic_scout: { price: 800, category: "cosmetic" },
+  title_champion: { price: 500, category: "title" }
+};
+const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "default", cosmetic: "default", title: "" };
+
+function normalizeLoadout(value) {
+  const v = value && typeof value === "object" ? value : {};
+  return {
+    primary: ["assault_rifle", "smg"].includes(v.primary) ? v.primary : "assault_rifle",
+    secondary: ["pistol", "smg"].includes(v.secondary) ? v.secondary : null,
+    skin: ["default", "neon", "abyss", "crimson", "arctic"].includes(v.skin) ? v.skin : "default",
+    cosmetic: ["default", "urban_camo", "elite_armor", "scout"].includes(v.cosmetic) ? v.cosmetic : "default",
+    title: ["", "veteran", "legend", "champion"].includes(v.title) ? v.title : ""
+  };
+}
+
+function loadoutForLevel(value, level) {
+  const v = normalizeLoadout(value);
+  if (level < 10 && v.primary === "smg") v.primary = "assault_rifle";
+  if (level < 2) v.secondary = null;
+  else if (!v.secondary || (v.secondary === "smg" && level < 10)) v.secondary = "pistol";
+  if (level < 5 && v.skin === "neon") v.skin = "default";
+  if (level < 75 && v.skin === "abyss") v.skin = level >= 5 ? "neon" : "default";
+  if (level < 25 && v.cosmetic !== "default") v.cosmetic = "default";
+  if (level < 150 && v.cosmetic === "elite_armor") v.cosmetic = level >= 25 ? "urban_camo" : "default";
+  if (level < 5 && v.title === "veteran") v.title = "";
+  if (level < 150 && v.title === "legend") v.title = level >= 5 ? "veteran" : "";
+  return v;
+}
+
+function loadoutForProfile(value, level, ownedItems = []) {
+  const loadout = loadoutForLevel(value, level);
+  const owned = new Set(Array.isArray(ownedItems) ? ownedItems : []);
+  if (loadout.skin === "crimson" && !owned.has("skin_crimson")) loadout.skin = "default";
+  if (loadout.skin === "arctic" && !owned.has("skin_arctic")) loadout.skin = "default";
+  if (loadout.cosmetic === "scout" && !owned.has("cosmetic_scout")) loadout.cosmetic = "default";
+  if (loadout.title === "champion" && !owned.has("title_champion")) loadout.title = "";
+  return loadout;
+}
+
 function profileNameKey(value) {
   return cleanName(value).normalize("NFKC").toLocaleLowerCase("en-US");
 }
+
 function profileView(row, fallbackName = "Player") {
   const totalXp = Math.max(0, Number(row?.total_xp) || 0);
+  const level = Math.floor(totalXp / XP_PER_LEVEL) + 1;
   return {
     name: row?.display_name || fallbackName,
     totalXp,
-    level: Math.floor(totalXp / XP_PER_LEVEL) + 1,
+    level,
     xp: totalXp % XP_PER_LEVEL,
     xpToNext: XP_PER_LEVEL,
     kills: Number(row?.total_kills) || 0,
     wins: Number(row?.total_wins) || 0,
-    matches: Number(row?.matches_played) || 0
+    matches: Number(row?.matches_played) || 0,
+    coins: Math.max(0, Number(row?.coins) || 0),
+    ownedItems: Array.isArray(row?.owned_items) ? row.owned_items : [],
+    equippedLoadout: loadoutForProfile(row?.equipped_loadout, level, row?.owned_items)
   };
 }
 
@@ -49,7 +96,7 @@ async function loadPlayerProfile(name) {
   const displayName = cleanName(name);
   const { data, error } = await supabase
     .from("player_profiles")
-    .select("display_name,total_xp,total_kills,total_wins,matches_played")
+    .select("display_name,total_xp,total_kills,total_wins,matches_played,equipped_loadout,coins,owned_items")
     .eq("name_key", profileNameKey(displayName))
     .maybeSingle();
   if (error) throw error;
@@ -64,6 +111,7 @@ async function awardMatchProgress(room) {
       ? room.outcome?.winner === "player" && room.outcome.winnerId === player.id
       : room.outcome?.winner === "squad";
     const earnedXp = Math.max(0, Number(player.matchXp) || 0) + 100 + (won ? 500 : 0);
+    const earnedCoins = Math.max(0, Number(player.matchKills) || 0) * 25 + 50 + (won ? 100 : 0);
     try {
       const { data, error } = await supabase.rpc("award_player_progress", {
         p_name_key: profileNameKey(player.name),
@@ -71,12 +119,15 @@ async function awardMatchProgress(room) {
         p_xp: earnedXp,
         p_kills: Math.max(0, Number(player.matchKills) || 0),
         p_wins: won ? 1 : 0,
-        p_matches: 1
+        p_matches: 1,
+        p_coins: earnedCoins
       });
       if (error) throw error;
       const row = Array.isArray(data) ? data[0] : data;
+      const updatedProfile = profileView(row, player.name);
+      const previousLevel = Math.max(1, Math.floor(Math.max(0, updatedProfile.totalXp - earnedXp) / XP_PER_LEVEL) + 1);
       io.to(player.id).emit("profileUpdated", {
-        ...profileView(row, player.name), earnedXp, won
+        ...updatedProfile, previousLevel, earnedXp, earnedCoins, won
       });
     } catch (error) {
       console.error("Could not save progression for", player.name, error.message);
@@ -88,6 +139,7 @@ async function awardMatchProgress(room) {
 async function awardFFAPlayerKill(player) {
   if (!supabase || !player) return;
   const earnedXp = 100;
+  const earnedCoins = 25;
   try {
     const { data, error } = await supabase.rpc("award_player_progress", {
       p_name_key: profileNameKey(player.name),
@@ -95,12 +147,15 @@ async function awardFFAPlayerKill(player) {
       p_xp: earnedXp,
       p_kills: 1,
       p_wins: 0,
-      p_matches: 0
+      p_matches: 0,
+      p_coins: earnedCoins
     });
     if (error) throw error;
     const row = Array.isArray(data) ? data[0] : data;
+    const updatedProfile = profileView(row, player.name);
+    const previousLevel = Math.max(1, Math.floor(Math.max(0, updatedProfile.totalXp - earnedXp) / XP_PER_LEVEL) + 1);
     io.to(player.id).emit("profileUpdated", {
-      ...profileView(row, player.name), earnedXp, won: false
+      ...updatedProfile, previousLevel, earnedXp, earnedCoins, won: false
     });
   } catch (error) {
     console.error("Could not save Free For All kill for", player.name, error.message);
@@ -139,16 +194,25 @@ function number(v, fallback = 0, min = -260, max = 260) {
 }
 
 function makeBots(mode = "squad") {
-  if (mode === "1v1" || mode === "ffa") return [];
-  return Array.from({ length: 10 }, (_, i) => ({
-    id: `bot-${i + 1}`,
-    x: Math.random() * 200 - 100,
-    z: Math.random() * 200 - 100,
-    health: 100,
-    shield: 25,
-    alive: true,
-    fire: 1 + Math.random() * 2
-  }));
+  if (mode === "1v1" || mode === "ffa") {
+    return [];
+  }
+
+  const bots = [];
+
+  for (let i = 0; i < 10; i++) {
+    bots.push({
+      id: "bot-" + (i + 1),
+      x: Math.random() * 200 - 100,
+      z: Math.random() * 200 - 100,
+      health: 100,
+      shield: 25,
+      alive: true,
+      fire: 1 + Math.random() * 2
+    });
+  }
+
+  return bots;
 }
 
 function makeRoom(code, payload = {}) {
@@ -188,6 +252,8 @@ function stateOf(room) {
     players: [...room.players.values()].map(p => ({
       id: p.id,
       name: p.name,
+      title: p.equippedLoadout?.title || "",
+      cosmetic: p.equippedLoadout?.cosmetic || "default",
       x: p.x,
       y: p.y,
       z: p.z,
@@ -214,13 +280,17 @@ function emitState(room) {
   io.to(room.code).emit("roomState", stateOf(room));
   broadcastServerList();
 }
+
 function publicServerList() {
   return [...rooms.values()].map(room => ({
     id: room.code, name: room.serverName, mode: room.mode,
     players: room.players.size, maxPlayers: room.maxPlayers, phase: room.phase
   }));
 }
-function broadcastServerList() { io.emit("serverList", publicServerList()); }
+
+function broadcastServerList() {
+  io.emit("serverList", publicServerList());
+}
 
 function shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz) {
   const segmentHitsBox = (a, b, half) => {
@@ -237,6 +307,7 @@ function shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz) {
     }
     return lo >= 0 && lo <= 1 && hi >= lo;
   };
+
   for (const structure of room.structures) {
     const yaw = Number(structure.yaw) || 0;
     const c=Math.cos(yaw), s=Math.sin(yaw);
@@ -251,6 +322,7 @@ function shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz) {
       const slope=Math.atan2(2.8,6.5);
       return { x, y:y*Math.cos(slope)+z*Math.sin(slope), z:-y*Math.sin(slope)+z*Math.cos(slope) };
     };
+
     const a={x:ox,y:oy,z:oz}, b={x:tx,y:ty,z:tz};
     if (structure.type === "ramp") {
       if (segmentHitsBox(rampLocal(a),rampLocal(b),{x:2.5,y:0.16,z:Math.hypot(6.5,2.8)/2})) return true;
@@ -271,6 +343,7 @@ function checkOutcome(room) {
     if (living.length === 0) room.outcome = { winner: "bots" };
     else if (room.bots.every(b => !b.alive)) room.outcome = { winner: "squad" };
   }
+
   if (room.outcome) {
     io.to(room.code).emit("matchEnded", room.outcome);
     emitState(room);
@@ -296,8 +369,13 @@ function leaveRoom(socket) {
 
   room.players.delete(socket.id);
   if (room.hostId === socket.id) room.hostId = room.players.keys().next().value || null;
-  if (!room.players.size) { rooms.delete(code); broadcastServerList(); }
-  else { checkOutcome(room); emitState(room); }
+  if (!room.players.size) {
+    rooms.delete(code);
+    broadcastServerList();
+  } else {
+    checkOutcome(room);
+    emitState(room);
+  }
 }
 
 function applyDamage(player, amount) {
@@ -353,7 +431,6 @@ io.on("connection", socket => {
 
   socket.on("getProfile", async (payload = {}, cb = () => {}) => {
     const name = cleanName(payload.name);
-    socket.data.playerName = name;
     if (!supabase) return cb({ ok: false, error: "Profile database is not connected yet. Finish the Supabase setup first." });
     try {
       const result = await loadPlayerProfile(name);
@@ -361,6 +438,110 @@ io.on("connection", socket => {
     } catch (error) {
       console.error("Profile lookup failed:", error.message);
       cb({ ok: false, error: "Could not load this profile. Check the Supabase table setup." });
+    }
+  });
+
+  socket.on("saveLoadout", async (payload = {}, cb = () => {}) => {
+    if (!supabase) return cb({ ok: false, error: "Inventory saving needs the Supabase inventory update." });
+    const name = cleanName(payload.name);
+    try {
+      const { error: seedError } = await supabase.from("player_profiles").upsert({
+        name_key: profileNameKey(name), display_name: name,
+        total_xp: 0, total_kills: 0, total_wins: 0, matches_played: 0,
+        equipped_loadout: DEFAULT_LOADOUT,
+        coins: 0,
+        owned_items: []
+      }, { onConflict: "name_key", ignoreDuplicates: true });
+      if (seedError) throw seedError;
+
+      const { data: row, error: readError } = await supabase.from("player_profiles")
+        .select("total_xp,equipped_loadout,owned_items").eq("name_key", profileNameKey(name)).maybeSingle();
+      if (readError) throw readError;
+      if (!row) return cb({ ok: false, error: "Play and earn progression first to create your saved profile." });
+
+      const level = Math.floor(Math.max(0, Number(row.total_xp) || 0) / XP_PER_LEVEL) + 1;
+      const loadout = loadoutForProfile(payload.loadout, level, row?.owned_items);
+      const { error: saveError } = await supabase.from("player_profiles")
+        .update({ equipped_loadout: loadout, updated_at: new Date().toISOString() })
+        .eq("name_key", profileNameKey(name));
+      if (saveError) throw saveError;
+
+      const room = getRoom(socket);
+      const player = room?.players.get(socket.id);
+      if (player && profileNameKey(player.name) === profileNameKey(name)) {
+        player.equippedLoadout = loadout;
+        emitState(room);
+      }
+      cb({ ok: true, loadout });
+    } catch (error) {
+      console.error("Could not save player loadout:", error.message);
+      cb({ ok: false, error: "Could not save inventory. Check that the Supabase inventory migration was run." });
+    }
+  });
+
+  socket.on("purchaseShopItem", async (payload = {}, cb = () => {}) => {
+    if (!supabase) return cb({ ok: false, error: "Coin purchases need the Supabase coin migration." });
+
+    const name = cleanName(payload.name);
+    const itemId = String(payload.itemId || "");
+    if (!SHOP_ITEMS[itemId]) {
+      return cb({ ok: false, error: "That shop item does not exist." });
+    }
+
+    try {
+      const { data, error } = await supabase.rpc("purchase_player_item", {
+        p_name_key: profileNameKey(name),
+        p_display_name: name,
+        p_item_id: itemId
+      });
+      if (error) throw error;
+
+      const result = Array.isArray(data) ? data[0] : data;
+      if (result?.already_owned) {
+        return cb({
+          ok: false,
+          error: "You already own this item.",
+          coins: Number(result.coins) || 0,
+          ownedItems: Array.isArray(result.owned_items) ? result.owned_items : []
+        });
+      }
+
+      const updated = await loadPlayerProfile(name);
+      cb({
+        ok: true,
+        coins: updated.profile.coins,
+        ownedItems: updated.profile.ownedItems,
+        profile: updated.profile
+      });
+      socket.emit("profileUpdated", updated.profile);
+    } catch (error) {
+      const message = String(error?.message || "");
+      console.error("Shop purchase failed for", name, message);
+      cb({
+        ok: false,
+        error: message.toLowerCase().includes("not enough")
+          ? "Not enough coins for this item."
+          : "Purchase failed. Check the Supabase coin migration and try again."
+      });
+    }
+  });
+
+  socket.on("setPlayerLoadout", async (payload = {}, cb = () => {}) => {
+    const room = getRoom(socket);
+    const player = room?.players.get(socket.id);
+    if (!room || !player || !supabase) return cb?.({ ok: false });
+
+    try {
+      const { data: row, error } = await supabase.from("player_profiles")
+        .select("total_xp,equipped_loadout,owned_items").eq("name_key", profileNameKey(player.name)).maybeSingle();
+      if (error) throw error;
+      const level = Math.floor(Math.max(0, Number(row?.total_xp) || 0) / XP_PER_LEVEL) + 1;
+      player.equippedLoadout = loadoutForProfile(row?.equipped_loadout, level, row?.owned_items);
+      emitState(room);
+      cb?.({ ok: true });
+    } catch (error) {
+      console.error("Could not apply player loadout:", error.message);
+      cb?.({ ok: false });
     }
   });
 
@@ -474,7 +655,8 @@ io.on("connection", socket => {
         p_xp: xp,
         p_kills: 0,
         p_wins: 0,
-        p_matches: 0
+        p_matches: 0,
+        p_coins: 0
       });
       if (error) throw error;
       const row = Array.isArray(data) ? data[0] : data;
@@ -493,6 +675,37 @@ io.on("connection", socket => {
     }
   });
 
+  socket.on("adminAdjustCoins", async (payload = {}, cb = () => {}) => {
+    if (!isAdmin(socket)) return cb({ ok: false, error: "Admin authentication required." });
+    if (!supabase) return cb({ ok: false, error: "Supabase is not configured on the server." });
+    const name = cleanName(payload.name);
+    const delta = Math.trunc(Number(payload.amount));
+    if (!name || !Number.isFinite(delta) || delta === 0 || Math.abs(delta) > 1000000) {
+      return cb({ ok: false, error: "Enter a player name and an amount from 1 to 1,000,000. Use a negative amount to remove coins." });
+    }
+    try {
+      const { data, error } = await supabase.rpc("admin_adjust_player_coins", {
+        p_name_key: profileNameKey(name),
+        p_display_name: name,
+        p_delta: delta
+      });
+      if (error) throw error;
+      const updated = await loadPlayerProfile(name);
+      const profile = updated.profile;
+      for (const room of rooms.values()) {
+        for (const player of room.players.values()) {
+          if (profileNameKey(player.name) === profileNameKey(name)) {
+            io.to(player.id).emit("profileUpdated", profile);
+          }
+        }
+      }
+      cb({ ok: true, profile, applied: Number(data?.applied_delta) || delta });
+    } catch (error) {
+      console.error("Admin coin adjustment failed:", error.message);
+      cb({ ok: false, error: "Could not update that player's coin balance. Check the admin coin migration." });
+    }
+  });
+
   socket.on("createRoom", (payload = {}, cb = () => {}) => {
     leaveRoom(socket);
     socket.data.playerName = cleanName(payload.name);
@@ -501,7 +714,7 @@ io.on("connection", socket => {
     const room = makeRoom(code, payload);
 
     room.hostId = socket.id;
-     room.players.set(socket.id, {
+    room.players.set(socket.id, {
       id: socket.id,
       name: cleanName(payload.name),
       x: 0,
@@ -519,6 +732,7 @@ io.on("connection", socket => {
       matchXp: 0,
       score: 0,
       materials: room.mode === "ffa" ? 999 : 100,
+      equippedLoadout: { ...DEFAULT_LOADOUT },
       lastShot: 0
     });
 
@@ -592,6 +806,7 @@ io.on("connection", socket => {
       matchXp: 0,
       score: 0,
       materials: room.mode === "ffa" ? 999 : 100,
+      equippedLoadout: { ...DEFAULT_LOADOUT },
       lastShot: 0
     });
 
@@ -623,6 +838,7 @@ io.on("connection", socket => {
     }
 
     if (room.mode === "1v1" && room.players.size !== 2) return cb({ ok: false, error: "A 1v1 match needs two players." });
+
     room.phase = "countdown";
     room.outcome = null;
     room.startAt = Date.now() + 5000;
@@ -667,6 +883,8 @@ io.on("connection", socket => {
     socket.to(room.code).emit("playerMoved", {
       id: p.id,
       name: p.name,
+      title: p.equippedLoadout?.title || "",
+      cosmetic: p.equippedLoadout?.cosmetic || "default",
       x: p.x,
       y: p.y,
       z: p.z,
@@ -685,13 +903,20 @@ io.on("connection", socket => {
     if (!room || !shooter || !shooter.alive) return;
 
     const now = Date.now();
+    const slot = data.slot === "secondary" ? "secondary" : "primary";
+    const loadout = normalizeLoadout(shooter.equippedLoadout);
+    const weaponId = slot === "secondary" ? loadout.secondary : loadout.primary;
+    if (slot === "secondary" && !weaponId) return;
 
-    if (now - shooter.lastShot < 85) return;
+    const weapon = weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
+      : weaponId === "smg" ? { cooldown: 75, damage: 18, speed: 82 }
+      : { cooldown: 100, damage: 25, speed: 85 };
+
+    if (now - shooter.lastShot < weapon.cooldown) return;
     shooter.lastShot = now;
 
     const o = data.origin || {};
     const d = data.direction || {};
-
     const ox = number(o.x, shooter.x);
     const oy = number(o.y, shooter.y + 1.7, -20, 100);
     const oz = number(o.z, shooter.z);
@@ -699,21 +924,17 @@ io.on("connection", socket => {
     let dx = number(d.x, 0, -1, 1);
     let dy = number(d.y, 0, -1, 1);
     let dz = number(d.z, -1, -1, 1);
-
     const len = Math.hypot(dx, dy, dz) || 1;
-
     dx /= len;
     dy /= len;
     dz /= len;
 
-    // Send the visible projectile to the other players in this room.
-    // Damage remains handled by the existing authoritative server hit check below.
     socket.to(room.code).emit("playerProjectile", {
       shooterId: shooter.id,
       shooterName: shooter.name,
       origin: { x: ox, y: oy, z: oz },
       direction: { x: dx, y: dy, z: dz },
-      speed: 85
+      speed: weapon.speed
     });
 
     for (const target of room.players.values()) {
@@ -723,13 +944,10 @@ io.on("connection", socket => {
       const tx = target.x;
       const ty = target.y + 1.2;
       const tz = target.z;
-
       const vx = tx - ox;
       const vy = ty - oy;
       const vz = tz - oz;
-
       const along = vx * dx + vy * dy + vz * dz;
-
       if (along < 0 || along > 90) continue;
 
       const dist = Math.hypot(
@@ -739,9 +957,8 @@ io.on("connection", socket => {
       );
 
       if (dist < 1.25) {
-        // A built wall/ramp between the muzzle and target absorbs the shot.
         if (shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz)) break;
-        applyDamage(target, 25);
+        applyDamage(target, weapon.damage);
 
         if (!target.alive) {
           shooter.kills++;
@@ -762,6 +979,7 @@ io.on("connection", socket => {
             { x: -12, z: -12 }, { x: 12, z: -12 }, { x: -12, z: 12 }, { x: 12, z: 12 }, { x: 18, z: 0 }
           ];
           const spawn = room.mode === "ffa" ? (ffaSpawns[Math.max(0,targetIndex)] || {x:0,z:0}) : (targetId === room.hostId ? { x: 0, z: 0 } : { x: 8, z: 0 });
+
           setTimeout(() => {
             const current = rooms.get(room.code);
             const respawning = current?.players.get(targetId);
@@ -785,23 +1003,15 @@ io.on("connection", socket => {
   socket.on("damageBot", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
-
     if (!room || !p || !p.alive) return;
 
-    const bot = room.bots.find(
-      b => b.id === String(data.id)
-    );
-
+    const bot = room.bots.find(b => b.id === String(data.id));
     if (!bot || !bot.alive) return;
 
     const amount = number(data.amount, 25, 0, 50);
     const absorbed = Math.min(bot.shield, amount);
-
     bot.shield -= absorbed;
-    bot.health = Math.max(
-      0,
-      bot.health - (amount - absorbed)
-    );
+    bot.health = Math.max(0, bot.health - (amount - absorbed));
 
     if (bot.health <= 0) {
       bot.alive = false;
@@ -816,13 +1026,9 @@ io.on("connection", socket => {
 
   socket.on("registerWorld", data => {
     const room = getRoom(socket);
-
     if (!room || room.worldReady) return;
 
-    const positions = Array.isArray(data.chests)
-      ? data.chests.slice(0, 100)
-      : [];
-
+    const positions = Array.isArray(data.chests) ? data.chests.slice(0, 100) : [];
     room.chests = positions.map((pos, i) => ({
       id: i,
       x: number(pos.x, 0),
@@ -838,30 +1044,18 @@ io.on("connection", socket => {
   socket.on("openChest", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
-
     if (!room || !p || !p.alive) return;
 
     const chest = room.chests[Number(data.index)];
-
-    if (
-      !chest ||
-      chest.opened ||
-      Math.hypot(p.x - chest.x, p.z - chest.z) > 5
-    ) return;
+    if (!chest || chest.opened || Math.hypot(p.x - chest.x, p.z - chest.z) > 5) return;
 
     chest.opened = true;
-    chest.loot = Math.random() < 0.5
-      ? "medkit"
-      : "potion";
+    chest.loot = Math.random() < 0.5 ? "medkit" : "potion";
 
-    if (chest.loot === "medkit") {
-      p.medkits++;
-    } else {
-      p.potions++;
-    }
+    if (chest.loot === "medkit") p.medkits++;
+    else p.potions++;
 
     emitState(room);
-
     socket.emit("gameNotice", {
       message: chest.loot === "medkit"
         ? "Found a MEDKIT! Press 4 to use it."
@@ -872,17 +1066,12 @@ io.on("connection", socket => {
   socket.on("useItem", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
-
     if (!room || !p || !p.alive) return;
 
     if (data.type === "medkit" && p.medkits > 0 && p.health < 100) {
       p.medkits--;
       p.health = Math.min(100, p.health + 40);
-    } else if (
-      data.type === "potion" &&
-      p.potions > 0 &&
-      p.shield < 100
-    ) {
+    } else if (data.type === "potion" && p.potions > 0 && p.shield < 100) {
       p.potions--;
       p.shield = Math.min(100, p.shield + 40);
     }
@@ -893,15 +1082,11 @@ io.on("connection", socket => {
   socket.on("buildStructure", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
-
     if (!room || !p || !p.alive || p.materials < 10) return;
 
-    const type = data.type === "ramp"
-      ? "ramp"
-      : "wall";
-
+    const type = data.type === "ramp" ? "ramp" : "wall";
     const structure = {
-      id: `${socket.id}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+      id: socket.id + "-" + Date.now() + "-" + Math.floor(Math.random() * 1e6),
       owner: socket.id,
       type,
       x: number(data.x, p.x),
@@ -911,28 +1096,19 @@ io.on("connection", socket => {
 
     p.materials = Math.max(0, p.materials - 10);
     room.structures.push(structure);
-
-    if (room.structures.length > 100) {
-      room.structures.shift();
-    }
-
+    if (room.structures.length > 100) room.structures.shift();
     emitState(room);
   });
 
   socket.on("vehicleUpdate", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
-
     if (!room || !p || !p.alive) return;
 
     const type = String(data.type || "").slice(0, 16);
-
-    if (!["truck", "sedan", "sports", "suv"].includes(type)) {
-      return;
-    }
+    if (!["truck", "sedan", "sports", "suv"].includes(type)) return;
 
     room.vehicles ||= {};
-
     room.vehicles[type] = {
       type,
       x: number(data.x, p.x),
@@ -941,16 +1117,12 @@ io.on("connection", socket => {
       driver: socket.id
     };
 
-    io.to(room.code).emit(
-      "vehicleMoved",
-      room.vehicles[type]
-    );
+    io.to(room.code).emit("vehicleMoved", room.vehicles[type]);
   });
 
   socket.on("playerVitals", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
-
     if (!room || !p) return;
 
     p.health = number(data.health, p.health, 0, 100);
@@ -962,7 +1134,6 @@ io.on("connection", socket => {
   });
 
   socket.on("requestServerList", () => socket.emit("serverList", publicServerList()));
-
   socket.on("leaveRoom", () => leaveRoom(socket));
   socket.on("disconnect", () => {
     socket.data.adminAuthenticated = false;
@@ -975,16 +1146,10 @@ setInterval(() => {
   const now = Date.now();
 
   for (const room of rooms.values()) {
-    const dt = Math.min(
-      0.2,
-      (now - room.lastTick) / 1000
-    );
-
+    const dt = Math.min(0.2, (now - room.lastTick) / 1000);
     room.lastTick = now;
 
-    const living = [...room.players.values()]
-      .filter(p => p.alive);
-
+    const living = [...room.players.values()].filter(p => p.alive);
     if (!living.length) continue;
     if (room.mode === "ffa") {
       emitState(room);
@@ -992,12 +1157,8 @@ setInterval(() => {
     }
 
     room.stormTime += dt;
-
     if (room.stormTime > 15) {
-      room.stormRadius = Math.max(
-        25,
-        room.stormRadius - dt * 0.8
-      );
+      room.stormRadius = Math.max(25, room.stormRadius - dt * 0.8);
     }
 
     for (const bot of room.bots) {
@@ -1005,45 +1166,42 @@ setInterval(() => {
 
       let target = null;
       let best = Infinity;
-
       for (const p of living) {
-        const d = Math.hypot(
-          p.x - bot.x,
-          p.z - bot.z
-        );
-
+        const d = Math.hypot(p.x - bot.x, p.z - bot.z);
         if (d < best) {
           best = d;
           target = p;
         }
       }
-
       if (!target) continue;
 
       if (best > 4) {
         const dx = target.x - bot.x;
         const dz = target.z - bot.z;
         const len = Math.hypot(dx, dz) || 1;
-
         bot.x += dx / len * 1.6 * dt;
         bot.z += dz / len * 1.6 * dt;
       }
 
       bot.fire -= dt;
-
       if (best < 65 && bot.fire <= 0) {
         const ox = bot.x, oy = 1.5, oz = bot.z;
         const tx = target.x, ty = target.y + 1.2, tz = target.z;
         const len = Math.hypot(tx-ox, ty-oy, tz-oz) || 1;
         const direction = { x:(tx-ox)/len, y:(ty-oy)/len, z:(tz-oz)/len };
-        room.botProjectiles.push({ x:ox, y:oy, z:oz, vx:direction.x*42, vy:direction.y*42, vz:direction.z*42, life:3, targetId:target.id });
-        io.to(room.code).emit("botProjectile", { origin:{x:ox,y:oy,z:oz}, direction, speed:42 });
+        room.botProjectiles.push({
+          x:ox, y:oy, z:oz,
+          vx:direction.x*42, vy:direction.y*42, vz:direction.z*42,
+          life:3, targetId:target.id
+        });
+        io.to(room.code).emit("botProjectile", {
+          origin:{x:ox,y:oy,z:oz}, direction, speed:42
+        });
         bot.fire = 1.5 + Math.random() * 1.5;
       }
 
       if (Math.hypot(bot.x, bot.z) > room.stormRadius) {
         bot.health -= dt * 2;
-
         if (bot.health <= 0) {
           bot.health = 0;
           bot.alive = false;
@@ -1054,25 +1212,29 @@ setInterval(() => {
     for (let i = room.botProjectiles.length - 1; i >= 0; i--) {
       const b = room.botProjectiles[i];
       const old = { x:b.x, y:b.y, z:b.z };
-      b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt; b.life -= dt;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.z += b.vz * dt;
+      b.life -= dt;
+
       if (shotBlockedByBuild(room, old.x, old.y, old.z, b.x, b.y, b.z)) {
         b.life = 0;
       }
+
       const target = room.players.get(b.targetId);
       if (b.life > 0 && target && target.alive) {
         const dx=target.x-b.x, dy=(target.y+1.2)-b.y, dz=target.z-b.z;
-        if (Math.hypot(dx,dy,dz) < 1.25) { applyDamage(target,10); b.life=0; }
+        if (Math.hypot(dx,dy,dz) < 1.25) {
+          applyDamage(target,10);
+          b.life=0;
+        }
       }
       if (b.life <= 0) room.botProjectiles.splice(i,1);
     }
 
     for (const p of room.players.values()) {
-      if (
-        p.alive &&
-        Math.hypot(p.x, p.z) > room.stormRadius
-      ) {
+      if (p.alive && Math.hypot(p.x, p.z) > room.stormRadius) {
         p._stormDamage = (p._stormDamage || 0) + dt;
-
         if (p._stormDamage >= 2) {
           applyDamage(p, 5);
           p._stormDamage = 0;
@@ -1088,9 +1250,7 @@ setInterval(() => {
 }, 100);
 
 const server = httpServer.listen(PORT, () =>
-  console.log(
-    `Battle Royale multiplayer server listening on port ${PORT}`
-  )
+  console.log("Battle Royale multiplayer server listening on port " + PORT)
 );
 
 process.on("SIGTERM", () =>
