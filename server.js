@@ -102,6 +102,7 @@ function stateOf(room) {
       medkits: p.medkits,
       potions: p.potions,
       kills: p.kills,
+      score: p.score || 0,
       materials: p.materials
     })),
     bots: room.bots.map(b => ({ ...b })),
@@ -138,14 +139,22 @@ function checkOutcome(room) {
   const living = [...room.players.values()].filter(p => p.alive);
 
   if (room.mode === "1v1") {
-    if (living.length <= 1 && (room.players.size >= 2 || (room.phase === "playing" && room.players.size === 1))) {
-      room.outcome = living.length === 1
-        ? { winner: "player", winnerId: living[0].id }
-        : { winner: "opponent" };
+    const winner = [...room.players.values()].find(p => (p.score || 0) >= 10);
+
+    if (winner) {
+      room.outcome = {
+        winner: "player",
+        winnerId: winner.id,
+        score: winner.score,
+        targetScore: 10
+      };
     }
   } else {
-    if (living.length === 0) room.outcome = { winner: "bots" };
-    else if (room.bots.every(b => !b.alive)) room.outcome = { winner: "squad" };
+    if (living.length === 0) {
+      room.outcome = { winner: "bots" };
+    } else if (room.bots.every(b => !b.alive)) {
+      room.outcome = { winner: "squad" };
+    }
   }
 
   if (room.outcome) {
@@ -200,10 +209,6 @@ function applyDamage(player, amount) {
   }
 }
 
-function playerById(room, id) {
-  return room.players.get(id);
-}
-
 io.on("connection", socket => {
 
   socket.on("createRoom", (payload = {}, cb = () => {}) => {
@@ -228,6 +233,7 @@ io.on("connection", socket => {
       medkits: 0,
       potions: 0,
       kills: 0,
+      score: 0,
       materials: 100,
       lastShot: 0
     });
@@ -267,7 +273,10 @@ io.on("connection", socket => {
     }
 
     if (room.phase !== "lobby") {
-      return cb({ ok: false, error: "That match has already started." });
+      return cb({
+        ok: false,
+        error: "That match has already started."
+      });
     }
 
     if (room.players.size >= room.maxPlayers) {
@@ -300,6 +309,7 @@ io.on("connection", socket => {
       medkits: 0,
       potions: 0,
       kills: 0,
+      score: 0,
       materials: 100,
       lastShot: 0
     });
@@ -324,18 +334,29 @@ io.on("connection", socket => {
   socket.on("startMatch", (_data = {}, cb = () => {}) => {
     const room = getRoom(socket);
 
-    if (!room) return cb({ ok: false, error: "Join a room first." });
+    if (!room) {
+      return cb({ ok: false, error: "Join a room first." });
+    }
 
     if (socket.id !== room.hostId) {
-      return cb({ ok: false, error: "Only the squad host can start the match." });
+      return cb({
+        ok: false,
+        error: "Only the squad host can start the match."
+      });
     }
 
     if (room.phase !== "lobby") {
-      return cb({ ok: false, error: "The match is already starting." });
+      return cb({
+        ok: false,
+        error: "The match is already starting."
+      });
     }
 
     if (room.mode === "1v1" && room.players.size !== 2) {
-      return cb({ ok: false, error: "A 1v1 match needs two players." });
+      return cb({
+        ok: false,
+        error: "A 1v1 match needs two players."
+      });
     }
 
     room.phase = "countdown";
@@ -453,10 +474,51 @@ io.on("connection", socket => {
 
         if (!target.alive) {
           shooter.kills++;
+
+          if (room.mode === "1v1") {
+            shooter.score = (shooter.score || 0) + 1;
+          }
         }
 
         checkOutcome(room);
         emitState(room);
+
+        if (room.mode === "1v1" && !room.outcome && !target.alive) {
+          const targetId = target.id;
+
+          const spawn = targetId === room.hostId
+            ? { x: 0, z: 0 }
+            : { x: 8, z: 0 };
+
+          setTimeout(() => {
+            const current = rooms.get(room.code);
+            const respawning = current?.players.get(targetId);
+
+            if (
+              !current ||
+              current.outcome ||
+              current.phase !== "playing" ||
+              !respawning
+            ) return;
+
+            respawning.health = 100;
+            respawning.shield = 100;
+            respawning.alive = true;
+            respawning.x = spawn.x;
+            respawning.y = 0;
+            respawning.z = spawn.z;
+            respawning.yaw = targetId === current.hostId ? 0 : Math.PI;
+
+            io.to(targetId).emit("playerRespawned", {
+              id: targetId,
+              x: spawn.x,
+              z: spawn.z
+            });
+
+            emitState(current);
+          }, 1400);
+        }
+
         break;
       }
     }
@@ -713,27 +775,31 @@ setInterval(() => {
         const ty = target.y + 1.2;
         const tz = target.z;
 
-        const len = Math.hypot(tx-ox, ty-oy, tz-oz) || 1;
+        const len = Math.hypot(
+          tx - ox,
+          ty - oy,
+          tz - oz
+        ) || 1;
 
         const direction = {
-          x: (tx-ox)/len,
-          y: (ty-oy)/len,
-          z: (tz-oz)/len
+          x: (tx - ox) / len,
+          y: (ty - oy) / len,
+          z: (tz - oz) / len
         };
 
         room.botProjectiles.push({
           x: ox,
           y: oy,
           z: oz,
-          vx: direction.x*42,
-          vy: direction.y*42,
-          vz: direction.z*42,
+          vx: direction.x * 42,
+          vy: direction.y * 42,
+          vz: direction.z * 42,
           life: 3,
           targetId: target.id
         });
 
         io.to(room.code).emit("botProjectile", {
-          origin: {x:ox,y:oy,z:oz},
+          origin: { x: ox, y: oy, z: oz },
           direction,
           speed: 42
         });
