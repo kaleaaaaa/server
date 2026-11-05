@@ -1,7 +1,7 @@
-
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -13,6 +13,73 @@ const io = new Server(httpServer, {
 const PORT = process.env.PORT || 3000;
 const rooms = new Map();
 const DEFAULT_MAX_PLAYERS = 4;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false }
+    })
+  : null;
+if (!supabase) console.warn("Supabase is not configured. Player progression saving is disabled until SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set.");
+
+const XP_PER_LEVEL = 500;
+function profileNameKey(value) {
+  return cleanName(value).normalize("NFKC").toLocaleLowerCase("en-US");
+}
+function profileView(row, fallbackName = "Player") {
+  const totalXp = Math.max(0, Number(row?.total_xp) || 0);
+  return {
+    name: row?.display_name || fallbackName,
+    totalXp,
+    level: Math.floor(totalXp / XP_PER_LEVEL) + 1,
+    xp: totalXp % XP_PER_LEVEL,
+    xpToNext: XP_PER_LEVEL,
+    kills: Number(row?.total_kills) || 0,
+    wins: Number(row?.total_wins) || 0,
+    matches: Number(row?.matches_played) || 0
+  };
+}
+
+async function loadPlayerProfile(name) {
+  if (!supabase) throw new Error("Supabase is not configured on the Render server yet.");
+  const displayName = cleanName(name);
+  const { data, error } = await supabase
+    .from("player_profiles")
+    .select("display_name,total_xp,total_kills,total_wins,matches_played")
+    .eq("name_key", profileNameKey(displayName))
+    .maybeSingle();
+  if (error) throw error;
+  return { found: !!data, profile: profileView(data, displayName) };
+}
+
+async function awardMatchProgress(room) {
+  if (!supabase || !room || room.progressAwarded) return;
+  room.progressAwarded = true;
+  await Promise.all([...room.players.values()].map(async player => {
+    const won = room.mode === "1v1"
+      ? room.outcome?.winner === "player" && room.outcome.winnerId === player.id
+      : room.outcome?.winner === "squad";
+    const earnedXp = Math.max(0, Number(player.matchXp) || 0) + 100 + (won ? 500 : 0);
+    try {
+      const { data, error } = await supabase.rpc("award_player_progress", {
+        p_name_key: profileNameKey(player.name),
+        p_display_name: cleanName(player.name),
+        p_xp: earnedXp,
+        p_kills: Math.max(0, Number(player.matchKills) || 0),
+        p_wins: won ? 1 : 0,
+        p_matches: 1
+      });
+      if (error) throw error;
+      const row = Array.isArray(data) ? data[0] : data;
+      io.to(player.id).emit("profileUpdated", {
+        ...profileView(row, player.name), earnedXp, won
+      });
+    } catch (error) {
+      console.error("Could not save progression for", player.name, error.message);
+      io.to(player.id).emit("gameNotice", { message: "Progress could not be saved. Check the server's Supabase settings." });
+    }
+  }));
+}
 
 app.get("/", (_req, res) =>
   res.type("text").send("Battle Royale multiplayer server is online.")
@@ -65,6 +132,7 @@ function makeRoom(code, payload = {}) {
     mode,
     maxPlayers: mode === "1v1" ? 2 : DEFAULT_MAX_PLAYERS,
     outcome: null,
+    progressAwarded: false,
     players: new Map(),
     hostId: null,
     phase: "lobby",
@@ -169,7 +237,7 @@ function shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz) {
 function checkOutcome(room) {
   if (!room || room.outcome || room.phase !== "playing") return;
   const living = [...room.players.values()].filter(p => p.alive);
-  if (room.mode === "1v1") {
+    if (room.mode === "1v1") {
     const winner = [...room.players.values()].find(p => (p.score || 0) >= 10);
     if (winner) room.outcome = { winner: "player", winnerId: winner.id, score: winner.score, targetScore: 10 };
   } else {
@@ -179,6 +247,7 @@ function checkOutcome(room) {
   if (room.outcome) {
     io.to(room.code).emit("matchEnded", room.outcome);
     emitState(room);
+    void awardMatchProgress(room);
   }
 }
 
@@ -225,6 +294,18 @@ function playerById(room, id) {
 
 io.on("connection", socket => {
 
+  socket.on("getProfile", async (payload = {}, cb = () => {}) => {
+    const name = cleanName(payload.name);
+    if (!supabase) return cb({ ok: false, error: "Profile database is not connected yet. Finish the Supabase setup first." });
+    try {
+      const result = await loadPlayerProfile(name);
+      cb({ ok: true, ...result });
+    } catch (error) {
+      console.error("Profile lookup failed:", error.message);
+      cb({ ok: false, error: "Could not load this profile. Check the Supabase table setup." });
+    }
+  });
+
   socket.on("createRoom", (payload = {}, cb = () => {}) => {
     leaveRoom(socket);
 
@@ -246,6 +327,8 @@ io.on("connection", socket => {
       medkits: 0,
       potions: 0,
       kills: 0,
+      matchKills: 0,
+      matchXp: 0,
       score: 0,
       materials: 100,
       lastShot: 0
@@ -314,6 +397,8 @@ io.on("connection", socket => {
       medkits: 0,
       potions: 0,
       kills: 0,
+      matchKills: 0,
+      matchXp: 0,
       score: 0,
       materials: 100,
       lastShot: 0
@@ -363,6 +448,11 @@ io.on("connection", socket => {
       if (!current || current.phase !== "countdown" ||
           current.startAt !== scheduledStart) return;
       current.phase = "playing";
+      current.progressAwarded = false;
+      for (const player of current.players.values()) {
+        player.matchXp = 0;
+        player.matchKills = 0;
+      }
       io.to(current.code).emit("matchStarted", {
         startAt: scheduledStart,
         players: current.players.size
@@ -464,6 +554,8 @@ io.on("connection", socket => {
 
         if (!target.alive) {
           shooter.kills++;
+          shooter.matchKills = (shooter.matchKills || 0) + 1;
+          shooter.matchXp = (shooter.matchXp || 0) + 100;
           if (room.mode === "1v1") shooter.score = (shooter.score || 0) + 1;
         }
 
@@ -492,8 +584,7 @@ io.on("connection", socket => {
       }
     }
   });
-
-  socket.on("damageBot", data => {
+    socket.on("damageBot", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
 
@@ -517,6 +608,8 @@ io.on("connection", socket => {
     if (bot.health <= 0) {
       bot.alive = false;
       p.kills++;
+      p.matchKills = (p.matchKills || 0) + 1;
+      p.matchXp = (p.matchXp || 0) + 25;
     }
 
     checkOutcome(room);
