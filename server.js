@@ -843,10 +843,7 @@ io.on("connection", socket => {
     emitState(room);
   });
 
-  socket.on("openChest", data => {
-    const room = getRoom(socket);
-    const p = room?.players.get(socket.id);
-      socket.on("openChest", data => {
+    socket.on("openChest", data => {
     const room = getRoom(socket);
     const p = room?.players.get(socket.id);
     if (!room || !p || !p.alive) return;
