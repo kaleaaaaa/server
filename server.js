@@ -19,7 +19,8 @@ const ADMIN_GRANTABLE_ITEMS = new Set([
   "skin_crimson", "skin_arctic", "cosmetic_scout", "title_champion",
   "skin_neon", "skin_abyss", "title_veteran", "title_legend",
   "weapon_smg", "cosmetic_urban_camo", "cosmetic_elite_armor",
-  "weapon_admin_gun", "skin_admin"
+  "weapon_admin_gun", "skin_admin", "cosmetic_admin_player",
+  "weapon_assault_rifle", "weapon_pistol"
 ]);
 const crypto = require("crypto");
 const DEFAULT_MAX_PLAYERS = 4;
@@ -47,7 +48,7 @@ function normalizeLoadout(value) {
     primary: ["assault_rifle", "smg", "admin_gun"].includes(v.primary) ? v.primary : "assault_rifle",
     secondary: ["pistol", "smg"].includes(v.secondary) ? v.secondary : null,
     skin: ["default", "neon", "abyss", "crimson", "arctic", "admin"].includes(v.skin) ? v.skin : "default",
-    cosmetic: ["default", "urban_camo", "elite_armor", "scout"].includes(v.cosmetic) ? v.cosmetic : "default",
+    cosmetic: ["default", "urban_camo", "elite_armor", "scout", "admin_player"].includes(v.cosmetic) ? v.cosmetic : "default",
     title: ["", "veteran", "legend", "champion"].includes(v.title) ? v.title : ""
   };
 }
@@ -78,6 +79,7 @@ function loadoutForProfile(value, level, ownedItems = []) {
   if (loadout.skin === "crimson" && !owned.has("skin_crimson")) loadout.skin = "default";
   if (loadout.skin === "arctic" && !owned.has("skin_arctic")) loadout.skin = "default";
   if (loadout.skin === "admin" && !owned.has("skin_admin")) loadout.skin = "default";
+  if (loadout.cosmetic === "admin_player" && !owned.has("cosmetic_admin_player")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "urban_camo" && level < 25 && !owned.has("cosmetic_urban_camo")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "scout" && !owned.has("cosmetic_scout")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "elite_armor" && level < 150 && !owned.has("cosmetic_elite_armor")) loadout.cosmetic = level >= 25 || owned.has("cosmetic_urban_camo") ? "urban_camo" : "default";
@@ -664,6 +666,46 @@ io.on("connection", socket => {
     }
   });
 
+  socket.on("adminRemoveItem", async (payload = {}, cb = () => {}) => {
+    if (!isAdmin(socket)) return cb({ ok: false, error: "Admin authentication required." });
+    if (!supabase) return cb({ ok: false, error: "Supabase is not configured on the server." });
+    const name = cleanName(payload.name);
+    const itemId = String(payload.itemId || "");
+    if (!name || !ADMIN_GRANTABLE_ITEMS.has(itemId)) return cb({ ok: false, error: "Choose a valid owned item." });
+    try {
+      const nameKey = profileNameKey(name);
+      const { data: row, error: readError } = await supabase.from("player_profiles")
+        .select("total_xp,equipped_loadout,owned_items").eq("name_key", nameKey).maybeSingle();
+      if (readError) throw readError;
+      if (!row) return cb({ ok: false, error: "Player profile not found." });
+      const ownedItems = (Array.isArray(row.owned_items) ? row.owned_items : []).filter(id => id !== itemId);
+      const level = Math.floor(Math.max(0, Number(row.total_xp) || 0) / XP_PER_LEVEL) + 1;
+      const loadout = loadoutForProfile(row.equipped_loadout, level, ownedItems);
+      const { error: updateError } = await supabase.from("player_profiles").update({
+        owned_items: ownedItems,
+        equipped_loadout: loadout,
+        updated_at: new Date().toISOString()
+      }).eq("name_key", nameKey);
+      if (updateError) throw updateError;
+      const updated = await loadPlayerProfile(name);
+      for (const room of rooms.values()) {
+        for (const player of room.players.values()) {
+          if (profileNameKey(player.name) === nameKey) {
+            player.ownedItems = [...updated.profile.ownedItems];
+            player.equippedLoadout = { ...updated.profile.equippedLoadout };
+            io.to(player.id).emit("profileUpdated", { ...updated.profile, itemRemoved: itemId });
+            emitState(room);
+          }
+        }
+      }
+      cb({ ok: true, profile: updated.profile, itemId });
+      io.emit("adminSnapshotChanged");
+    } catch (error) {
+      console.error("Admin item removal failed:", error.message);
+      cb({ ok: false, error: "Could not remove that item from the player's inventory." });
+    }
+  });
+
   socket.on("adminKickPlayer", (payload = {}, cb = () => {}) => {
     if (!isAdmin(socket)) return cb({ ok: false, error: "Admin authentication required." });
     const targetId = String(payload.playerId || "");
@@ -1023,7 +1065,8 @@ io.on("connection", socket => {
       shooterName: shooter.name,
       origin: { x: ox, y: oy, z: oz },
       direction: { x: dx, y: dy, z: dz },
-      speed: weapon.speed
+      speed: weapon.speed,
+      weaponId
     });
 
     for (const target of room.players.values()) {
