@@ -70,6 +70,7 @@ function loadoutForProfile(value, level, ownedItems = []) {
   const loadout = normalizeLoadout(value);
   const owned = new Set(Array.isArray(ownedItems) ? ownedItems : []);
   if (level < 10 && loadout.primary === "smg" && !owned.has("weapon_smg")) loadout.primary = "assault_rifle";
+  // Admin Gun is a primary-slot weapon; keep it equipped when the saved profile owns it.
   if (loadout.primary === "admin_gun" && !owned.has("weapon_admin_gun")) loadout.primary = "assault_rifle";
   if (level < 2 && loadout.secondary) loadout.secondary = null;
   if (level < 5 && loadout.skin === "neon" && !owned.has("skin_neon")) loadout.skin = "default";
@@ -997,7 +998,7 @@ io.on("connection", socket => {
     if (weaponId === "admin_gun" && !(shooter.ownedItems || []).includes("weapon_admin_gun")) return;
     const weapon = weaponId === "admin_gun" ? { cooldown: 25, damage: 45, speed: 120 }
       : weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
-      : weaponId === "smg" ? { cooldown: 75, damage: 18, speed: 82 }
+      : weaponId === "smg" ? { cooldown: 75, damage: 15, speed: 82 }
       : { cooldown: 100, damage: 25, speed: 85 };
 
     if (now - shooter.lastShot < weapon.cooldown) return;
