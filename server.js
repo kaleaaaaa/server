@@ -20,7 +20,7 @@ const ADMIN_GRANTABLE_ITEMS = new Set([
   "skin_neon", "skin_abyss", "title_veteran", "title_legend",
   "weapon_smg", "cosmetic_urban_camo", "cosmetic_elite_armor",
   "weapon_admin_gun", "skin_admin", "cosmetic_admin_player",
-  "weapon_assault_rifle", "weapon_pistol"
+  "weapon_assault_rifle", "weapon_pistol", "weapon_shockwave_revolver"
 ]);
 const crypto = require("crypto");
 const DEFAULT_MAX_PLAYERS = 4;
@@ -38,7 +38,8 @@ const SHOP_ITEMS = {
   skin_crimson: { price: 300, category: "skin" },
   skin_arctic: { price: 600, category: "skin" },
   cosmetic_scout: { price: 800, category: "cosmetic" },
-  title_champion: { price: 500, category: "title" }
+  title_champion: { price: 500, category: "title" },
+  weapon_shockwave_revolver: { price: 3000, category: "weapon" }
 };
 const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "default", cosmetic: "default", title: "" };
 
@@ -46,7 +47,7 @@ function normalizeLoadout(value) {
   const v = value && typeof value === "object" ? value : {};
   return {
     primary: ["assault_rifle", "smg", "admin_gun"].includes(v.primary) ? v.primary : "assault_rifle",
-    secondary: ["pistol", "smg"].includes(v.secondary) ? v.secondary : null,
+    secondary: ["pistol", "smg", "shockwave_revolver"].includes(v.secondary) ? v.secondary : null,
     skin: ["default", "neon", "abyss", "crimson", "arctic", "admin"].includes(v.skin) ? v.skin : "default",
     cosmetic: ["default", "urban_camo", "elite_armor", "scout", "admin_player"].includes(v.cosmetic) ? v.cosmetic : "default",
     title: ["", "veteran", "legend", "champion"].includes(v.title) ? v.title : ""
@@ -70,6 +71,7 @@ function loadoutForLevel(value, level) {
 function loadoutForProfile(value, level, ownedItems = []) {
   const loadout = normalizeLoadout(value);
   const owned = new Set(Array.isArray(ownedItems) ? ownedItems : []);
+  if (loadout.secondary === "shockwave_revolver" && !owned.has("weapon_shockwave_revolver")) loadout.secondary = level >= 2 ? "pistol" : null;
   if (level < 10 && loadout.primary === "smg" && !owned.has("weapon_smg")) loadout.primary = "assault_rifle";
   // Admin Gun is a primary-slot weapon; keep it equipped when the saved profile owns it.
   if (loadout.primary === "admin_gun" && !owned.has("weapon_admin_gun")) loadout.primary = "assault_rifle";
@@ -1095,6 +1097,7 @@ io.on("connection", socket => {
     if (weaponId === "admin_gun" && !(shooter.ownedItems || []).includes("weapon_admin_gun")) return;
     const weapon = weaponId === "admin_gun" ? { cooldown: 25, damage: 45, speed: 120 }
       : weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
+      : weaponId === "shockwave_revolver" ? { cooldown: 850, damage: 0, speed: 42 }
       : weaponId === "smg" ? { cooldown: 75, damage: 15, speed: 82 }
       : { cooldown: 100, damage: 25, speed: 85 };
 
