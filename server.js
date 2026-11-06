@@ -14,6 +14,13 @@ const PORT = process.env.PORT || 3000;
 const rooms = new Map();
 const ADMIN_OWNER_NAME = "kale";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+let adminGunGrantsEnabled = false;
+const ADMIN_GRANTABLE_ITEMS = new Set([
+  "skin_crimson", "skin_arctic", "cosmetic_scout", "title_champion",
+  "skin_neon", "skin_abyss", "title_veteran", "title_legend",
+  "weapon_smg", "cosmetic_urban_camo", "cosmetic_elite_armor",
+  "weapon_admin_gun", "skin_admin"
+]);
 const crypto = require("crypto");
 const DEFAULT_MAX_PLAYERS = 4;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -37,9 +44,9 @@ const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "defa
 function normalizeLoadout(value) {
   const v = value && typeof value === "object" ? value : {};
   return {
-    primary: ["assault_rifle", "smg"].includes(v.primary) ? v.primary : "assault_rifle",
+    primary: ["assault_rifle", "smg", "admin_gun"].includes(v.primary) ? v.primary : "assault_rifle",
     secondary: ["pistol", "smg"].includes(v.secondary) ? v.secondary : null,
-    skin: ["default", "neon", "abyss", "crimson", "arctic"].includes(v.skin) ? v.skin : "default",
+    skin: ["default", "neon", "abyss", "crimson", "arctic", "admin"].includes(v.skin) ? v.skin : "default",
     cosmetic: ["default", "urban_camo", "elite_armor", "scout"].includes(v.cosmetic) ? v.cosmetic : "default",
     title: ["", "veteran", "legend", "champion"].includes(v.title) ? v.title : ""
   };
@@ -60,11 +67,21 @@ function loadoutForLevel(value, level) {
 }
 
 function loadoutForProfile(value, level, ownedItems = []) {
-  const loadout = loadoutForLevel(value, level);
+  const loadout = normalizeLoadout(value);
   const owned = new Set(Array.isArray(ownedItems) ? ownedItems : []);
+  if (level < 10 && loadout.primary === "smg" && !owned.has("weapon_smg")) loadout.primary = "assault_rifle";
+  if (loadout.primary === "admin_gun" && !owned.has("weapon_admin_gun")) loadout.primary = "assault_rifle";
+  if (level < 2 && loadout.secondary) loadout.secondary = null;
+  if (level < 5 && loadout.skin === "neon" && !owned.has("skin_neon")) loadout.skin = "default";
+  if (level < 75 && loadout.skin === "abyss" && !owned.has("skin_abyss")) loadout.skin = level >= 5 ? "neon" : "default";
   if (loadout.skin === "crimson" && !owned.has("skin_crimson")) loadout.skin = "default";
   if (loadout.skin === "arctic" && !owned.has("skin_arctic")) loadout.skin = "default";
+  if (loadout.skin === "admin" && !owned.has("skin_admin")) loadout.skin = "default";
+  if (loadout.cosmetic === "urban_camo" && level < 25 && !owned.has("cosmetic_urban_camo")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "scout" && !owned.has("cosmetic_scout")) loadout.cosmetic = "default";
+  if (loadout.cosmetic === "elite_armor" && level < 150 && !owned.has("cosmetic_elite_armor")) loadout.cosmetic = level >= 25 || owned.has("cosmetic_urban_camo") ? "urban_camo" : "default";
+  if (level < 5 && loadout.title === "veteran" && !owned.has("title_veteran")) loadout.title = "";
+  if (level < 150 && loadout.title === "legend" && !owned.has("title_legend")) loadout.title = level >= 5 ? "veteran" : "";
   if (loadout.title === "champion" && !owned.has("title_champion")) loadout.title = "";
   return loadout;
 }
@@ -411,6 +428,7 @@ function safePasswordMatch(candidate) {
 
 function adminSnapshot() {
   return {
+    adminGunGrantsEnabled,
     rooms: [...rooms.values()].map(room => ({
       code: room.code,
       name: room.serverName,
@@ -470,6 +488,7 @@ io.on("connection", socket => {
       const player = room?.players.get(socket.id);
       if (player && profileNameKey(player.name) === profileNameKey(name)) {
         player.equippedLoadout = loadout;
+        player.ownedItems = Array.isArray(row?.owned_items) ? row.owned_items : [];
         emitState(room);
       }
       cb({ ok: true, loadout });
@@ -536,7 +555,8 @@ io.on("connection", socket => {
         .select("total_xp,equipped_loadout,owned_items").eq("name_key", profileNameKey(player.name)).maybeSingle();
       if (error) throw error;
       const level = Math.floor(Math.max(0, Number(row?.total_xp) || 0) / XP_PER_LEVEL) + 1;
-      player.equippedLoadout = loadoutForProfile(row?.equipped_loadout, level, row?.owned_items);
+      player.ownedItems = Array.isArray(row?.owned_items) ? row.owned_items : [];
+      player.equippedLoadout = loadoutForProfile(row?.equipped_loadout, level, player.ownedItems);
       emitState(room);
       cb?.({ ok: true });
     } catch (error) {
@@ -575,6 +595,72 @@ io.on("connection", socket => {
   socket.on("adminGetSnapshot", (_payload = {}, cb = () => {}) => {
     if (!isAdmin(socket)) return cb({ ok: false, error: "Admin authentication required." });
     cb({ ok: true, snapshot: adminSnapshot() });
+  });
+
+  socket.on("adminLookupPlayer", async (payload = {}, cb = () => {}) => {
+    if (!isAdmin(socket)) return cb({ ok: false, error: "Admin authentication required." });
+    if (!supabase) return cb({ ok: false, error: "Supabase is not configured on the server." });
+    const name = cleanName(payload.name);
+    try {
+      const result = await loadPlayerProfile(name);
+      cb({ ok: true, found: result.found, profile: result.profile });
+    } catch (error) {
+      console.error("Admin player lookup failed:", error.message);
+      cb({ ok: false, error: "Could not load that player's saved inventory." });
+    }
+  });
+
+  socket.on("adminSetAdminGunGrants", (payload = {}, cb = () => {}) => {
+    if (!isAdmin(socket)) return cb({ ok: false, error: "Admin authentication required." });
+    adminGunGrantsEnabled = payload.enabled === true;
+    io.emit("adminSnapshotChanged");
+    cb({ ok: true, enabled: adminGunGrantsEnabled });
+  });
+
+  socket.on("adminGrantItem", async (payload = {}, cb = () => {}) => {
+    if (!isAdmin(socket)) return cb({ ok: false, error: "Admin authentication required." });
+    if (!supabase) return cb({ ok: false, error: "Supabase is not configured on the server." });
+    const name = cleanName(payload.name);
+    const itemId = String(payload.itemId || "");
+    if (!name || !ADMIN_GRANTABLE_ITEMS.has(itemId)) return cb({ ok: false, error: "Choose a valid game item." });
+    if (itemId === "weapon_admin_gun" && !adminGunGrantsEnabled) {
+      return cb({ ok: false, error: "Admin gun distribution is disabled. Enable it in the admin panel first." });
+    }
+    try {
+      const nameKey = profileNameKey(name);
+      const { error: seedError } = await supabase.from("player_profiles").upsert({
+        name_key: nameKey, display_name: name, total_xp: 0, total_kills: 0,
+        total_wins: 0, matches_played: 0, equipped_loadout: DEFAULT_LOADOUT,
+        coins: 0, owned_items: []
+      }, { onConflict: "name_key", ignoreDuplicates: true });
+      if (seedError) throw seedError;
+      const { data: row, error: readError } = await supabase.from("player_profiles")
+        .select("total_xp,total_kills,total_wins,matches_played,equipped_loadout,coins,owned_items")
+        .eq("name_key", nameKey).maybeSingle();
+      if (readError) throw readError;
+      if (!row) throw new Error("Player profile not found after creation.");
+      const ownedItems = Array.isArray(row.owned_items) ? row.owned_items : [];
+      if (!ownedItems.includes(itemId)) ownedItems.push(itemId);
+      const { error: updateError } = await supabase.from("player_profiles")
+        .update({ owned_items: ownedItems, updated_at: new Date().toISOString() })
+        .eq("name_key", nameKey);
+      if (updateError) throw updateError;
+      const updated = await loadPlayerProfile(name);
+      for (const room of rooms.values()) {
+        for (const player of room.players.values()) {
+          if (profileNameKey(player.name) === nameKey) {
+            player.ownedItems = [...updated.profile.ownedItems];
+            player.equippedLoadout = loadoutForProfile(row.equipped_loadout, updated.profile.level, player.ownedItems);
+            io.to(player.id).emit("profileUpdated", { ...updated.profile, itemGranted: itemId });
+          }
+        }
+      }
+      cb({ ok: true, profile: updated.profile, itemId });
+      io.emit("adminSnapshotChanged");
+    } catch (error) {
+      console.error("Admin item grant failed:", error.message);
+      cb({ ok: false, error: "Could not grant that item. Check the Supabase inventory migration." });
+    }
   });
 
   socket.on("adminKickPlayer", (payload = {}, cb = () => {}) => {
@@ -908,7 +994,9 @@ io.on("connection", socket => {
     const weaponId = slot === "secondary" ? loadout.secondary : loadout.primary;
     if (slot === "secondary" && !weaponId) return;
 
-    const weapon = weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
+    if (weaponId === "admin_gun" && !(shooter.ownedItems || []).includes("weapon_admin_gun")) return;
+    const weapon = weaponId === "admin_gun" ? { cooldown: 25, damage: 45, speed: 120 }
+      : weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
       : weaponId === "smg" ? { cooldown: 75, damage: 18, speed: 82 }
       : { cooldown: 100, damage: 25, speed: 85 };
 
