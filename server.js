@@ -417,8 +417,19 @@ function playerById(room, id) {
   return room.players.get(id);
 }
 
+
+function canUsePlayerName(socket, name) {
+  const key = profileNameKey(name);
+  if (key === ADMIN_OWNER_NAME) {
+    return socket.data.kaleAccountAuthenticated === true &&
+      String(socket.data.playerName || "").toLowerCase() === ADMIN_OWNER_NAME;
+  }
+  return socket.data.kaleAccountAuthenticated !== true;
+}
+
 function isAdmin(socket) {
-  return socket.data.adminAuthenticated === true &&
+  return socket.data.kaleAccountAuthenticated === true &&
+    socket.data.adminAuthenticated === true &&
     String(socket.data.playerName || "").toLowerCase() === ADMIN_OWNER_NAME;
 }
 
@@ -450,8 +461,44 @@ function adminSnapshot() {
 
 io.on("connection", socket => {
 
+
+  socket.on("kaleAccountLogin", (payload = {}, cb = () => {}) => {
+    const submittedName = cleanName(payload.name).toLowerCase();
+    const now = Date.now();
+    const attempts = socket.data.kaleLoginAttempts || { count: 0, since: now };
+    if (now - attempts.since > 10 * 60 * 1000) {
+      attempts.count = 0;
+      attempts.since = now;
+    }
+    if (attempts.count >= 5) {
+      socket.data.kaleLoginAttempts = attempts;
+      return cb({ ok: false, error: "Too many login attempts. Wait 10 minutes and try again." });
+    }
+    if (submittedName !== ADMIN_OWNER_NAME || !safePasswordMatch(payload.password)) {
+      attempts.count++;
+      socket.data.kaleLoginAttempts = attempts;
+      socket.data.kaleAccountAuthenticated = false;
+      socket.data.adminAuthenticated = false;
+      return cb({ ok: false, error: "Incorrect Kale account password." });
+    }
+    leaveRoom(socket);
+    socket.data.playerName = ADMIN_OWNER_NAME;
+    socket.data.kaleAccountAuthenticated = true;
+    socket.data.adminAuthenticated = true;
+    socket.data.kaleLoginAttempts = { count: 0, since: now };
+    cb({ ok: true, snapshot: adminSnapshot() });
+  });
+
+  socket.on("kaleAccountLogout", () => {
+    leaveRoom(socket);
+    socket.data.kaleAccountAuthenticated = false;
+    socket.data.adminAuthenticated = false;
+    delete socket.data.playerName;
+  });
+
   socket.on("getProfile", async (payload = {}, cb = () => {}) => {
     const name = cleanName(payload.name);
+    if (!canUsePlayerName(socket, name)) return cb({ ok: false, error: "The Kale account requires its password." });
     if (!supabase) return cb({ ok: false, error: "Profile database is not connected yet. Finish the Supabase setup first." });
     try {
       const result = await loadPlayerProfile(name);
@@ -465,6 +512,7 @@ io.on("connection", socket => {
   socket.on("saveLoadout", async (payload = {}, cb = () => {}) => {
     if (!supabase) return cb({ ok: false, error: "Inventory saving needs the Supabase inventory update." });
     const name = cleanName(payload.name);
+    if (!canUsePlayerName(socket, name)) return cb({ ok: false, error: "The Kale account requires its password." });
     try {
       const { error: seedError } = await supabase.from("player_profiles").upsert({
         name_key: profileNameKey(name), display_name: name,
@@ -505,6 +553,7 @@ io.on("connection", socket => {
     if (!supabase) return cb({ ok: false, error: "Coin purchases need the Supabase coin migration." });
 
     const name = cleanName(payload.name);
+    if (!canUsePlayerName(socket, name)) return cb({ ok: false, error: "The Kale account requires its password." });
     const itemId = String(payload.itemId || "");
     if (!SHOP_ITEMS[itemId]) {
       return cb({ ok: false, error: "That shop item does not exist." });
@@ -552,6 +601,7 @@ io.on("connection", socket => {
     const room = getRoom(socket);
     const player = room?.players.get(socket.id);
     if (!room || !player || !supabase) return cb?.({ ok: false });
+    if (!canUsePlayerName(socket, player.name)) return cb?.({ ok: false, error: "The Kale account requires its password." });
 
     try {
       const { data: row, error } = await supabase.from("player_profiles")
@@ -569,6 +619,7 @@ io.on("connection", socket => {
   });
 
   socket.on("adminLogin", (payload = {}, cb = () => {}) => {
+    if (!socket.data.kaleAccountAuthenticated) return cb({ ok: false, error: "Unlock the Kale account first." });
     const submittedName = cleanName(payload.name);
     const identityName = socket.data.playerName || submittedName;
     const now = Date.now();
@@ -836,8 +887,10 @@ io.on("connection", socket => {
   });
 
   socket.on("createRoom", (payload = {}, cb = () => {}) => {
+    const requestedName = cleanName(payload.name);
+    if (!canUsePlayerName(socket, requestedName)) return cb({ ok: false, error: "The Kale account requires its password." });
     leaveRoom(socket);
-    socket.data.playerName = cleanName(payload.name);
+    socket.data.playerName = requestedName;
 
     const code = makeRoomCode();
     const room = makeRoom(code, payload);
@@ -884,8 +937,10 @@ io.on("connection", socket => {
   });
 
   socket.on("joinRoom", (payload = {}, cb = () => {}) => {
+    const requestedName = cleanName(payload.name);
+    if (!canUsePlayerName(socket, requestedName)) return cb({ ok: false, error: "The Kale account requires its password." });
     leaveRoom(socket);
-    socket.data.playerName = cleanName(payload.name);
+    socket.data.playerName = requestedName;
 
     const code = String(payload.serverId || payload.roomCode || "")
       .trim()
@@ -1269,6 +1324,7 @@ io.on("connection", socket => {
   socket.on("leaveRoom", () => leaveRoom(socket));
   socket.on("disconnect", () => {
     socket.data.adminAuthenticated = false;
+    socket.data.kaleAccountAuthenticated = false;
     leaveRoom(socket);
   });
 });
