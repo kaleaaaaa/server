@@ -1109,6 +1109,7 @@ io.on("connection", socket => {
       : weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
       : weaponId === "shockwave_revolver" ? { cooldown: 850, damage: 0, speed: 42 }
       : weaponId === "smg" ? { cooldown: 75, damage: 15, speed: 82 }
+      : weaponId === "sniper" ? { cooldown: 1250, damage: 200, speed: 190, range: 400 }
       : { cooldown: 100, damage: 25, speed: 85 };
 
     if (now - shooter.lastShot < weapon.cooldown) return;
@@ -1148,7 +1149,7 @@ io.on("connection", socket => {
       const vy = ty - oy;
       const vz = tz - oz;
       const along = vx * dx + vy * dy + vz * dz;
-      if (along < 0 || along > 90) continue;
+      if (along < 0 || along > (weapon.range || 90)) continue;
 
       const dist = Math.hypot(
         vx - dx * along,
@@ -1208,7 +1209,7 @@ io.on("connection", socket => {
     const bot = room.bots.find(b => b.id === String(data.id));
     if (!bot || !bot.alive) return;
 
-    const amount = number(data.amount, 25, 0, 50);
+    const amount = number(data.amount, 25, 0, 200);
     const absorbed = Math.min(bot.shield, amount);
     bot.shield -= absorbed;
     bot.health = Math.max(0, bot.health - (amount - absorbed));
