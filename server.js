@@ -263,6 +263,7 @@ function makeRoom(code, payload = {}) {
     code,
     serverName: String(payload.serverName || "New Server").trim().slice(0, 28) || "New Server",
     mode,
+    map: payload.map === "winter" ? "winter" : "default",
     maxPlayers: mode === "1v1" ? 2 : mode === "ffa" ? 10 : DEFAULT_MAX_PLAYERS,
     outcome: null,
     progressAwarded: false,
@@ -286,6 +287,7 @@ function stateOf(room) {
     roomCode: room.code,
     serverName: room.serverName,
     mode: room.mode,
+    map: room.map,
     maxPlayers: room.maxPlayers,
     outcome: room.outcome,
     hostId: room.hostId,
@@ -325,7 +327,7 @@ function emitState(room) {
 
 function publicServerList() {
   return [...rooms.values()].map(room => ({
-    id: room.code, name: room.serverName, mode: room.mode,
+    id: room.code, name: room.serverName, mode: room.mode, map: room.map,
     players: room.players.size, maxPlayers: room.maxPlayers, phase: room.phase
   }));
 }
@@ -979,7 +981,8 @@ io.on("connection", socket => {
       spawnZ: 0,
       isHost: true,
       serverName: room.serverName,
-      mode: room.mode
+      mode: room.mode,
+      map: room.map
     });
 
     emitState(room);
@@ -1054,7 +1057,8 @@ io.on("connection", socket => {
       spawnZ: spawn.z,
       isHost: socket.id === room.hostId,
       serverName: room.serverName,
-      mode: room.mode
+      mode: room.mode,
+      map: room.map
     });
 
     emitState(room);
