@@ -20,8 +20,10 @@ const ADMIN_GRANTABLE_ITEMS = new Set([
   "skin_neon", "skin_abyss", "title_veteran", "title_legend",
   "weapon_smg", "cosmetic_urban_camo", "cosmetic_elite_armor",
   "weapon_admin_gun", "skin_admin", "cosmetic_admin_player",
-  "weapon_assault_rifle", "weapon_pistol", "weapon_sniper", "weapon_shockwave_revolver"
+  "weapon_assault_rifle", "weapon_pistol", "weapon_sniper", "weapon_shockwave_revolver",
+  "weapon_frost_ray", "skin_snow_camo", "title_frosty"
 ]);
+const FROST_SLOW_MS = 3500;
 const crypto = require("crypto");
 const DEFAULT_MAX_PLAYERS = 4;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -40,20 +42,25 @@ const SHOP_ITEMS = {
   cosmetic_scout: { price: 800, category: "cosmetic" },
   title_champion: { price: 500, category: "title" },
   weapon_shockwave_revolver: { price: 3000, category: "weapon" },
-  weapon_sniper: { price: 1500, category: "weapon" }
+  weapon_sniper: { price: 1500, category: "weapon" },
+  // Winter Shop. These are bought directly (see purchaseWithoutRpc) so they work
+  // without changing the Supabase purchase_player_item function.
+  weapon_frost_ray: { price: 2000, category: "weapon", direct: true },
+  title_frosty: { price: 500, category: "title", direct: true },
+  skin_snow_camo: { price: 1000, category: "skin", direct: true }
 };
 const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "default", cosmetic: "default", title: "" };
 
 function normalizeLoadout(value) {
   const v = value && typeof value === "object" ? value : {};
-  const weaponIds = ["assault_rifle", "pistol", "smg", "sniper", "shockwave_revolver", "admin_gun"];
+  const weaponIds = ["assault_rifle", "pistol", "smg", "sniper", "shockwave_revolver", "frost_ray", "admin_gun"];
   return {
     // Any owned/unlocked weapon may be assigned to either weapon slot.
     primary: weaponIds.includes(v.primary) ? v.primary : "assault_rifle",
     secondary: weaponIds.includes(v.secondary) ? v.secondary : null,
-    skin: ["default", "neon", "abyss", "crimson", "arctic", "admin"].includes(v.skin) ? v.skin : "default",
+    skin: ["default", "neon", "abyss", "crimson", "arctic", "snow_camo", "admin"].includes(v.skin) ? v.skin : "default",
     cosmetic: ["default", "urban_camo", "elite_armor", "scout", "admin_player"].includes(v.cosmetic) ? v.cosmetic : "default",
-    title: ["", "veteran", "legend", "champion"].includes(v.title) ? v.title : ""
+    title: ["", "veteran", "legend", "champion", "frosty"].includes(v.title) ? v.title : ""
   };
 }
 
@@ -80,6 +87,7 @@ function loadoutForProfile(value, level, ownedItems = []) {
     if (id === "smg") return level >= 10 || owned.has("weapon_smg");
     if (id === "sniper") return owned.has("weapon_sniper");
     if (id === "shockwave_revolver") return owned.has("weapon_shockwave_revolver");
+    if (id === "frost_ray") return owned.has("weapon_frost_ray");
     if (id === "admin_gun") return owned.has("weapon_admin_gun");
     return false;
   };
@@ -90,6 +98,7 @@ function loadoutForProfile(value, level, ownedItems = []) {
   if (level < 75 && loadout.skin === "abyss" && !owned.has("skin_abyss")) loadout.skin = level >= 5 ? "neon" : "default";
   if (loadout.skin === "crimson" && !owned.has("skin_crimson")) loadout.skin = "default";
   if (loadout.skin === "arctic" && !owned.has("skin_arctic")) loadout.skin = "default";
+  if (loadout.skin === "snow_camo" && !owned.has("skin_snow_camo")) loadout.skin = "default";
   if (loadout.skin === "admin" && !owned.has("skin_admin")) loadout.skin = "default";
   if (loadout.cosmetic === "admin_player" && !owned.has("cosmetic_admin_player")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "urban_camo" && level < 25 && !owned.has("cosmetic_urban_camo")) loadout.cosmetic = "default";
@@ -98,6 +107,7 @@ function loadoutForProfile(value, level, ownedItems = []) {
   if (level < 5 && loadout.title === "veteran" && !owned.has("title_veteran")) loadout.title = "";
   if (level < 150 && loadout.title === "legend" && !owned.has("title_legend")) loadout.title = level >= 5 ? "veteran" : "";
   if (loadout.title === "champion" && !owned.has("title_champion")) loadout.title = "";
+  if (loadout.title === "frosty" && !owned.has("title_frosty")) loadout.title = "";
   return loadout;
 }
 
@@ -410,6 +420,29 @@ function leaveRoom(socket) {
   }
 }
 
+// Buys a shop item by updating coins and owned_items directly. The coin balance is
+// used as a compare-and-swap guard so two simultaneous purchases cannot both succeed.
+async function purchaseWithoutRpc(name, itemId) {
+  const item = SHOP_ITEMS[itemId];
+  const nameKey = profileNameKey(name);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { data: row, error } = await supabase.from("player_profiles")
+      .select("coins,owned_items").eq("name_key", nameKey).maybeSingle();
+    if (error) throw error;
+    const coins = Math.max(0, Number(row?.coins) || 0);
+    const owned = Array.isArray(row?.owned_items) ? row.owned_items : [];
+    if (owned.includes(itemId)) return { already_owned: true, coins, owned_items: owned };
+    if (!row || coins < item.price) throw new Error("Not enough coins");
+    const { data: updated, error: updateError } = await supabase.from("player_profiles")
+      .update({ coins: coins - item.price, owned_items: [...owned, itemId], updated_at: new Date().toISOString() })
+      .eq("name_key", nameKey).eq("coins", row.coins)
+      .select("coins,owned_items");
+    if (updateError) throw updateError;
+    if (updated && updated.length) return { already_owned: false, coins: updated[0].coins, owned_items: updated[0].owned_items };
+  }
+  throw new Error("Purchase conflict, please try again");
+}
+
 function applyDamage(player, amount) {
   if (!player || !player.alive) return;
 
@@ -572,14 +605,18 @@ io.on("connection", socket => {
     }
 
     try {
-      const { data, error } = await supabase.rpc("purchase_player_item", {
-        p_name_key: profileNameKey(name),
-        p_display_name: name,
-        p_item_id: itemId
-      });
-      if (error) throw error;
-
-      const result = Array.isArray(data) ? data[0] : data;
+      let result;
+      if (SHOP_ITEMS[itemId].direct) {
+        result = await purchaseWithoutRpc(name, itemId);
+      } else {
+        const { data, error } = await supabase.rpc("purchase_player_item", {
+          p_name_key: profileNameKey(name),
+          p_display_name: name,
+          p_item_id: itemId
+        });
+        if (error) throw error;
+        result = Array.isArray(data) ? data[0] : data;
+      }
       if (result?.already_owned) {
         return cb({
           ok: false,
@@ -1105,7 +1142,9 @@ io.on("connection", socket => {
     if (slot === "secondary" && !weaponId) return;
 
     if (weaponId === "admin_gun" && !(shooter.ownedItems || []).includes("weapon_admin_gun")) return;
+    if (weaponId === "frost_ray" && !(shooter.ownedItems || []).includes("weapon_frost_ray")) return;
     const weapon = weaponId === "admin_gun" ? { cooldown: 25, damage: 45, speed: 120 }
+      : weaponId === "frost_ray" ? { cooldown: 600, damage: 0, speed: 100, slowMs: FROST_SLOW_MS }
       : weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
       : weaponId === "shockwave_revolver" ? { cooldown: 850, damage: 0, speed: 42 }
       : weaponId === "smg" ? { cooldown: 75, damage: 15, speed: 82 }
@@ -1159,6 +1198,12 @@ io.on("connection", socket => {
 
       if (dist < 1.25) {
         if (shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz)) break;
+        if (weapon.slowMs) {
+          // Frost Ray: no damage, only slows the target for a short time.
+          io.to(target.id).emit("playerSlowed", { ms: weapon.slowMs, by: shooter.name });
+          socket.emit("slowHit", { id: target.id });
+          break;
+        }
         applyDamage(target, weapon.damage);
 
         if (!target.alive) {
@@ -1210,6 +1255,7 @@ io.on("connection", socket => {
     if (!bot || !bot.alive) return;
 
     const amount = number(data.amount, 25, 0, 200);
+    if (data.slow === true) bot.slowUntil = Date.now() + FROST_SLOW_MS;
     const absorbed = Math.min(bot.shield, amount);
     bot.shield -= absorbed;
     bot.health = Math.max(0, bot.health - (amount - absorbed));
@@ -1381,8 +1427,9 @@ setInterval(() => {
         const dx = target.x - bot.x;
         const dz = target.z - bot.z;
         const len = Math.hypot(dx, dz) || 1;
-        bot.x += dx / len * 1.6 * dt;
-        bot.z += dz / len * 1.6 * dt;
+        const botSpeed = 1.6 * (Date.now() < (bot.slowUntil || 0) ? 0.45 : 1);
+        bot.x += dx / len * botSpeed * dt;
+        bot.z += dz / len * botSpeed * dt;
       }
 
       bot.fire -= dt;
