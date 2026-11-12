@@ -21,7 +21,8 @@ const ADMIN_GRANTABLE_ITEMS = new Set([
   "weapon_smg", "cosmetic_urban_camo", "cosmetic_elite_armor",
   "weapon_admin_gun", "skin_admin", "cosmetic_admin_player",
   "weapon_assault_rifle", "weapon_pistol", "weapon_sniper", "weapon_shockwave_revolver",
-  "weapon_frost_ray", "skin_snow_camo", "title_frosty"
+  "weapon_frost_ray", "skin_snow_camo", "title_frosty",
+  "skin_candy_cane", "skin_frostbite", "cosmetic_snowman", "title_ice_breaker", "title_blizzard"
 ]);
 const FROST_SLOW_MS = 3500;
 const crypto = require("crypto");
@@ -47,7 +48,12 @@ const SHOP_ITEMS = {
   // without changing the Supabase purchase_player_item function.
   weapon_frost_ray: { price: 2000, category: "weapon", direct: true },
   title_frosty: { price: 500, category: "title", direct: true },
-  skin_snow_camo: { price: 1000, category: "skin", direct: true }
+  skin_snow_camo: { price: 1000, category: "skin", direct: true },
+  skin_candy_cane: { price: 800, category: "skin", direct: true },
+  skin_frostbite: { price: 600, category: "skin", direct: true },
+  cosmetic_snowman: { price: 1200, category: "cosmetic", direct: true },
+  title_ice_breaker: { price: 750, category: "title", direct: true },
+  title_blizzard: { price: 1000, category: "title", direct: true }
 };
 const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "default", cosmetic: "default", title: "" };
 
@@ -58,9 +64,9 @@ function normalizeLoadout(value) {
     // Any owned/unlocked weapon may be assigned to either weapon slot.
     primary: weaponIds.includes(v.primary) ? v.primary : "assault_rifle",
     secondary: weaponIds.includes(v.secondary) ? v.secondary : null,
-    skin: ["default", "neon", "abyss", "crimson", "arctic", "snow_camo", "admin"].includes(v.skin) ? v.skin : "default",
-    cosmetic: ["default", "urban_camo", "elite_armor", "scout", "admin_player"].includes(v.cosmetic) ? v.cosmetic : "default",
-    title: ["", "veteran", "legend", "champion", "frosty"].includes(v.title) ? v.title : ""
+    skin: ["default", "neon", "abyss", "crimson", "arctic", "snow_camo", "candy_cane", "frostbite", "admin"].includes(v.skin) ? v.skin : "default",
+    cosmetic: ["default", "urban_camo", "elite_armor", "scout", "snowman", "admin_player"].includes(v.cosmetic) ? v.cosmetic : "default",
+    title: ["", "veteran", "legend", "champion", "frosty", "ice_breaker", "blizzard"].includes(v.title) ? v.title : ""
   };
 }
 
@@ -99,15 +105,20 @@ function loadoutForProfile(value, level, ownedItems = []) {
   if (loadout.skin === "crimson" && !owned.has("skin_crimson")) loadout.skin = "default";
   if (loadout.skin === "arctic" && !owned.has("skin_arctic")) loadout.skin = "default";
   if (loadout.skin === "snow_camo" && !owned.has("skin_snow_camo")) loadout.skin = "default";
+  if (loadout.skin === "candy_cane" && !owned.has("skin_candy_cane")) loadout.skin = "default";
+  if (loadout.skin === "frostbite" && !owned.has("skin_frostbite")) loadout.skin = "default";
   if (loadout.skin === "admin" && !owned.has("skin_admin")) loadout.skin = "default";
   if (loadout.cosmetic === "admin_player" && !owned.has("cosmetic_admin_player")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "urban_camo" && level < 25 && !owned.has("cosmetic_urban_camo")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "scout" && !owned.has("cosmetic_scout")) loadout.cosmetic = "default";
+  if (loadout.cosmetic === "snowman" && !owned.has("cosmetic_snowman")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "elite_armor" && level < 150 && !owned.has("cosmetic_elite_armor")) loadout.cosmetic = level >= 25 || owned.has("cosmetic_urban_camo") ? "urban_camo" : "default";
   if (level < 5 && loadout.title === "veteran" && !owned.has("title_veteran")) loadout.title = "";
   if (level < 150 && loadout.title === "legend" && !owned.has("title_legend")) loadout.title = level >= 5 ? "veteran" : "";
   if (loadout.title === "champion" && !owned.has("title_champion")) loadout.title = "";
   if (loadout.title === "frosty" && !owned.has("title_frosty")) loadout.title = "";
+  if (loadout.title === "ice_breaker" && !owned.has("title_ice_breaker")) loadout.title = "";
+  if (loadout.title === "blizzard" && !owned.has("title_blizzard")) loadout.title = "";
   return loadout;
 }
 
@@ -1152,7 +1163,7 @@ io.on("connection", socket => {
       : weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
       : weaponId === "shockwave_revolver" ? { cooldown: 850, damage: 0, speed: 42 }
       : weaponId === "smg" ? { cooldown: 75, damage: 15, speed: 82 }
-      : weaponId === "sniper" ? { cooldown: 1250, damage: 200, speed: 190, range: 400 }
+      : weaponId === "sniper" ? { cooldown: 1250, damage: 200, speed: 190, range: 400, headshot: true }
       : { cooldown: 100, damage: 25, speed: 85 };
 
     if (now - shooter.lastShot < weapon.cooldown) return;
@@ -1208,12 +1219,15 @@ io.on("connection", socket => {
           socket.emit("slowHit", { id: target.id });
           break;
         }
+        // Sniper headshot: the ray passes through the upper part of the player when it hits.
+        const headshot = !!weapon.headshot && (oy + dy * along - target.y) >= 1.5;
         applyDamage(target, weapon.damage);
+        socket.emit("hitConfirm", { id: target.id, headshot, weaponId, kill: !target.alive });
 
         if (!target.alive) {
           shooter.kills++;
           shooter.matchKills = (shooter.matchKills || 0) + 1;
-          shooter.matchXp = (shooter.matchXp || 0) + 100;
+          shooter.matchXp = (shooter.matchXp || 0) + 100 + (headshot ? 50 : 0); // +50 XP for a sniper headshot kill
           if (room.mode === "1v1" || room.mode === "ffa") shooter.score = (shooter.score || 0) + 1;
           if (room.mode === "ffa") void awardFFAPlayerKill(shooter);
         }
