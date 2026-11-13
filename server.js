@@ -331,6 +331,13 @@ function stateOf(room) {
   };
 }
 
+// Every skin has its own kill effect. The killer's equipped skin decides which one
+// everyone in the room sees where the victim went down.
+function emitKillEffect(room, x, y, z, killer, victimId) {
+  const skin = normalizeLoadout(killer?.equippedLoadout).skin;
+  io.to(room.code).emit("killEffect", { x, y, z, skin, victim: victimId });
+}
+
 function emitState(room) {
   io.to(room.code).emit("roomState", stateOf(room));
   broadcastServerList();
@@ -1227,7 +1234,8 @@ io.on("connection", socket => {
         if (!target.alive) {
           shooter.kills++;
           shooter.matchKills = (shooter.matchKills || 0) + 1;
-          shooter.matchXp = (shooter.matchXp || 0) + 100 + (headshot ? 50 : 0); // +50 XP for a sniper headshot kill
+          shooter.matchXp = (shooter.matchXp || 0) + 100;
+          emitKillEffect(room, target.x, target.y + 0.9, target.z, shooter, target.id);
           if (room.mode === "1v1" || room.mode === "ffa") shooter.score = (shooter.score || 0) + 1;
           if (room.mode === "ffa") void awardFFAPlayerKill(shooter);
         }
@@ -1283,6 +1291,7 @@ io.on("connection", socket => {
       p.kills++;
       p.matchKills = (p.matchKills || 0) + 1;
       p.matchXp = (p.matchXp || 0) + 25;
+      emitKillEffect(room, bot.x, 0.9, bot.z, p, bot.id);
     }
 
     checkOutcome(room);
