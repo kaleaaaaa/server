@@ -1166,7 +1166,7 @@ io.on("connection", socket => {
     if (weaponId === "admin_gun" && !(shooter.ownedItems || []).includes("weapon_admin_gun")) return;
     if (weaponId === "frost_ray" && !(shooter.ownedItems || []).includes("weapon_frost_ray")) return;
     const weapon = weaponId === "admin_gun" ? { cooldown: 25, damage: 45, speed: 120 }
-      : weaponId === "frost_ray" ? { cooldown: 600, damage: 0, speed: 100, slowMs: FROST_SLOW_MS }
+      : weaponId === "frost_ray" ? { cooldown: 600, damage: 0, speed: 100, range: 120, slowMs: FROST_SLOW_MS }
       : weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
       : weaponId === "shockwave_revolver" ? { cooldown: 850, damage: 0, speed: 42 }
       : weaponId === "smg" ? { cooldown: 75, damage: 15, speed: 82 }
@@ -1190,14 +1190,17 @@ io.on("connection", socket => {
     dy /= len;
     dz /= len;
 
-    socket.to(room.code).emit("playerProjectile", {
+    const projectilePayload = {
       shooterId: shooter.id,
       shooterName: shooter.name,
       origin: { x: ox, y: oy, z: oz },
       direction: { x: dx, y: dy, z: dz },
       speed: weapon.speed,
       weaponId
-    });
+    };
+    // The Frost Ray is an instant beam; it is sent after the hit check so it can end at the target.
+    if (!weapon.slowMs) socket.to(room.code).emit("playerProjectile", projectilePayload);
+    let beamLength = weapon.range || 90;
 
     for (const target of room.players.values()) {
       if (room.mode !== "1v1" && room.mode !== "ffa") break;
@@ -1224,6 +1227,7 @@ io.on("connection", socket => {
           // Frost Ray: no damage, only slows the target for a short time.
           io.to(target.id).emit("playerSlowed", { ms: weapon.slowMs, by: shooter.name });
           socket.emit("slowHit", { id: target.id });
+          beamLength = along;
           break;
         }
         // Sniper headshot: the ray passes through the upper part of the player when it hits.
@@ -1269,6 +1273,10 @@ io.on("connection", socket => {
         }
         break;
       }
+    }
+
+    if (weapon.slowMs) {
+      socket.to(room.code).emit("playerProjectile", { ...projectilePayload, beam: true, length: beamLength });
     }
   });
 
