@@ -521,6 +521,22 @@ async function purchaseWithoutRpc(name, itemId) {
   throw new Error("Purchase conflict, please try again");
 }
 
+// Reloads a player's owned items from Supabase (at most once every 5 seconds per player).
+async function refreshPlayerOwnership(player) {
+  if (!supabase || !player || player.refreshingOwnership) return;
+  player.refreshingOwnership = true;
+  try {
+    const { data: row, error } = await supabase.from("player_profiles")
+      .select("owned_items").eq("name_key", profileNameKey(player.name)).maybeSingle();
+    if (error) throw error;
+    if (Array.isArray(row?.owned_items)) player.ownedItems = row.owned_items;
+  } catch (error) {
+    console.warn("Could not refresh owned items for", player.name, error.message);
+  } finally {
+    setTimeout(() => { player.refreshingOwnership = false; }, 5000);
+  }
+}
+
 function applyDamage(player, amount) {
   if (!player || !player.alive) return;
 
@@ -1240,8 +1256,14 @@ io.on("connection", socket => {
     const weaponId = slot === "secondary" ? loadout.secondary : loadout.primary;
     if (slot === "secondary" && !weaponId) return;
 
-    if (weaponId === "admin_gun" && !(shooter.ownedItems || []).includes("weapon_admin_gun")) return;
-    if (weaponId === "frost_ray" && !(shooter.ownedItems || []).includes("weapon_frost_ray")) return;
+    const ownershipItem = weaponId === "admin_gun" ? "weapon_admin_gun" : weaponId === "frost_ray" ? "weapon_frost_ray" : "";
+    if (ownershipItem && !(shooter.ownedItems || []).includes(ownershipItem)) {
+      // The server doesn't think this player owns the weapon (for example their profile didn't
+      // load when they joined). Re-check their saved items so the next shot can work.
+      console.warn(`Shot ignored: ${shooter.name} fired ${weaponId} but ${ownershipItem} is not in their loaded items.`);
+      void refreshPlayerOwnership(shooter);
+      return;
+    }
     const weapon = weaponId === "admin_gun" ? { cooldown: 25, damage: 45, speed: 120 }
       : weaponId === "frost_ray" ? { cooldown: 600, damage: 0, speed: 100, range: 120, slowMs: FROST_SLOW_MS }
       : weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
