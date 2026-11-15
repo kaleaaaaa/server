@@ -44,17 +44,75 @@ const SHOP_ITEMS = {
   title_champion: { price: 500, category: "title" },
   weapon_shockwave_revolver: { price: 3000, category: "weapon" },
   weapon_sniper: { price: 1500, category: "weapon" },
-  // Winter Shop. These are bought directly (see purchaseWithoutRpc) so they work
-  // without changing the Supabase purchase_player_item function.
-  weapon_frost_ray: { price: 2000, category: "weapon", direct: true },
-  title_frosty: { price: 500, category: "title", direct: true },
-  skin_snow_camo: { price: 1000, category: "skin", direct: true },
-  skin_candy_cane: { price: 800, category: "skin", direct: true },
-  skin_frostbite: { price: 600, category: "skin", direct: true },
-  cosmetic_snowman: { price: 1200, category: "cosmetic", direct: true },
-  title_ice_breaker: { price: 750, category: "title", direct: true },
-  title_blizzard: { price: 1000, category: "title", direct: true }
+  // Winter Shop (event "winter"). These are bought directly (see purchaseWithoutRpc) so
+  // they work without changing the Supabase purchase_player_item function.
+  weapon_frost_ray: { price: 2000, category: "weapon", direct: true, event: "winter" },
+  title_frosty: { price: 500, category: "title", direct: true, event: "winter" },
+  skin_snow_camo: { price: 1000, category: "skin", direct: true, event: "winter" },
+  skin_candy_cane: { price: 800, category: "skin", direct: true, event: "winter" },
+  skin_frostbite: { price: 600, category: "skin", direct: true, event: "winter" },
+  cosmetic_snowman: { price: 1200, category: "cosmetic", direct: true, event: "winter" },
+  title_ice_breaker: { price: 750, category: "title", direct: true, event: "winter" },
+  title_blizzard: { price: 1000, category: "title", direct: true, event: "winter" }
 };
+
+// Shop events. The admin panel switches each one on or off. An item with an `event` field
+// in SHOP_ITEMS can only be bought while that event is on; players who already own it keep it.
+// To add an event: add it here, tag its items with `event: "<id>"` above, and add the
+// matching tab items in the game HTML (EVENT_ITEMS). `defaultEnabled` is used until the
+// admin has switched it (and in the shop_events table, if that table exists).
+const SHOP_EVENTS = {
+  // `map` is the map this event unlocks: it can only be picked for new servers while the event is on.
+  winter: { name: "Winter Shop", icon: "❄", defaultEnabled: true, map: "winter" }
+};
+const shopEventState = {};
+for (const [id, event] of Object.entries(SHOP_EVENTS)) shopEventState[id] = event.defaultEnabled !== false;
+let shopEventsPersisted = false;
+
+function publicShopEvents() {
+  return Object.entries(SHOP_EVENTS).map(([id, event]) => ({
+    id, name: event.name, icon: event.icon, enabled: shopEventState[id] === true, map: event.map || ""
+  }));
+}
+
+// "default" is always available; any other map is available only while its event is on.
+function mapAvailable(mapId) {
+  if (mapId === "default") return true;
+  return Object.entries(SHOP_EVENTS).some(([id, event]) => event.map === mapId && shopEventState[id] === true);
+}
+
+// Reads saved on/off states from the shop_events table. If the table has not been created
+// yet the switches still work, they just reset to their defaults when the server restarts.
+async function loadShopEvents() {
+  if (!supabase) return;
+  try {
+    const { data, error } = await supabase.from("shop_events").select("id,enabled");
+    if (error) throw error;
+    for (const row of data || []) {
+      if (SHOP_EVENTS[row.id]) shopEventState[row.id] = row.enabled === true;
+    }
+    shopEventsPersisted = true;
+    io.emit("shopEvents", publicShopEvents());
+  } catch (error) {
+    shopEventsPersisted = false;
+    console.warn("Shop event switches are not being saved (run the shop_events SQL to keep them across restarts):", error.message);
+  }
+}
+
+async function saveShopEvent(id, enabled) {
+  if (!supabase) return false;
+  try {
+    const { error } = await supabase.from("shop_events")
+      .upsert({ id, enabled, updated_at: new Date().toISOString() }, { onConflict: "id" });
+    if (error) throw error;
+    shopEventsPersisted = true;
+    return true;
+  } catch (error) {
+    shopEventsPersisted = false;
+    console.warn("Could not save shop event switch:", error.message);
+    return false;
+  }
+}
 const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "default", cosmetic: "default", title: "" };
 
 function normalizeLoadout(value) {
@@ -274,7 +332,7 @@ function makeRoom(code, payload = {}) {
     code,
     serverName: String(payload.serverName || "New Server").trim().slice(0, 28) || "New Server",
     mode,
-    map: payload.map === "winter" ? "winter" : "default",
+    map: payload.map === "winter" && mapAvailable("winter") ? "winter" : "default",
     maxPlayers: mode === "1v1" ? 2 : mode === "ffa" ? 10 : DEFAULT_MAX_PLAYERS,
     outcome: null,
     progressAwarded: false,
@@ -508,6 +566,8 @@ function safePasswordMatch(candidate) {
 function adminSnapshot() {
   return {
     adminGunGrantsEnabled,
+    shopEvents: publicShopEvents(),
+    shopEventsPersisted,
     rooms: [...rooms.values()].map(room => ({
       code: room.code,
       name: room.serverName,
@@ -525,7 +585,8 @@ function adminSnapshot() {
 }
 
 io.on("connection", socket => {
-
+  // Tell the game which shop events are running so it only shows those shop tabs.
+  socket.emit("shopEvents", publicShopEvents());
 
   socket.on("kaleAccountLogin", (payload = {}, cb = () => {}) => {
     const submittedName = cleanName(payload.name).toLowerCase();
@@ -622,6 +683,10 @@ io.on("connection", socket => {
     const itemId = String(payload.itemId || "");
     if (!SHOP_ITEMS[itemId]) {
       return cb({ ok: false, error: "That shop item does not exist." });
+    }
+    const eventId = SHOP_ITEMS[itemId].event;
+    if (eventId && shopEventState[eventId] !== true) {
+      return cb({ ok: false, error: `The ${SHOP_EVENTS[eventId]?.name || "event"} isn't running right now.` });
     }
 
     try {
@@ -738,6 +803,18 @@ io.on("connection", socket => {
     adminGunGrantsEnabled = payload.enabled === true;
     io.emit("adminSnapshotChanged");
     cb({ ok: true, enabled: adminGunGrantsEnabled });
+  });
+
+  socket.on("adminSetShopEvent", async (payload = {}, cb = () => {}) => {
+    if (!isAdmin(socket)) return cb({ ok: false, error: "Admin authentication required." });
+    const id = String(payload.id || "");
+    if (!SHOP_EVENTS[id]) return cb({ ok: false, error: "That shop event does not exist." });
+    if (typeof payload.enabled !== "boolean") return cb({ ok: false, error: "Choose on or off." });
+    shopEventState[id] = payload.enabled;
+    const saved = await saveShopEvent(id, payload.enabled);
+    io.emit("shopEvents", publicShopEvents());
+    io.emit("adminSnapshotChanged");
+    cb({ ok: true, events: publicShopEvents(), saved, persisted: shopEventsPersisted });
   });
 
   socket.on("adminGrantItem", async (payload = {}, cb = () => {}) => {
@@ -1536,6 +1613,7 @@ setInterval(() => {
 const server = httpServer.listen(PORT, () =>
   console.log("Battle Royale multiplayer server listening on port " + PORT)
 );
+void loadShopEvents();
 
 process.on("SIGTERM", () =>
   server.close(() => process.exit(0))
