@@ -408,8 +408,25 @@ function publicServerList() {
   }));
 }
 
+// The server list goes to every connected player, and emitState() runs for every room tick
+// (10 times a second), so send it at most once a second and only when it actually changed.
+let lastServerListJson = "";
+let lastServerListAt = 0;
+let serverListTimer = null;
 function broadcastServerList() {
-  io.emit("serverList", publicServerList());
+  const now = Date.now();
+  if (now - lastServerListAt < 1000) {
+    if (!serverListTimer) {
+      serverListTimer = setTimeout(() => { serverListTimer = null; broadcastServerList(); }, 1000 - (now - lastServerListAt));
+    }
+    return;
+  }
+  const list = publicServerList();
+  const json = JSON.stringify(list);
+  lastServerListAt = now;
+  if (json === lastServerListJson) return;
+  lastServerListJson = json;
+  io.emit("serverList", list);
 }
 
 function shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz) {
