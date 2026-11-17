@@ -19,7 +19,7 @@ const ADMIN_GRANTABLE_ITEMS = new Set([
   "skin_crimson", "skin_arctic", "cosmetic_scout", "title_champion",
   "skin_neon", "skin_abyss", "title_veteran", "title_legend",
   "weapon_smg", "cosmetic_urban_camo", "cosmetic_elite_armor",
-  "weapon_admin_gun", "skin_admin", "cosmetic_admin_player",
+  "weapon_admin_gun", "skin_admin", "skin_photo", "cosmetic_admin_player",
   "weapon_assault_rifle", "weapon_pistol", "weapon_sniper", "weapon_shockwave_revolver",
   "weapon_frost_ray", "skin_snow_camo", "title_frosty",
   "skin_candy_cane", "skin_frostbite", "cosmetic_snowman", "title_ice_breaker", "title_blizzard"
@@ -122,7 +122,7 @@ function normalizeLoadout(value) {
     // Any owned/unlocked weapon may be assigned to either weapon slot.
     primary: weaponIds.includes(v.primary) ? v.primary : "assault_rifle",
     secondary: weaponIds.includes(v.secondary) ? v.secondary : null,
-    skin: ["default", "neon", "abyss", "crimson", "arctic", "snow_camo", "candy_cane", "frostbite", "admin"].includes(v.skin) ? v.skin : "default",
+    skin: ["default", "neon", "abyss", "crimson", "arctic", "snow_camo", "candy_cane", "frostbite", "admin", "photo"].includes(v.skin) ? v.skin : "default",
     cosmetic: ["default", "urban_camo", "elite_armor", "scout", "snowman", "admin_player"].includes(v.cosmetic) ? v.cosmetic : "default",
     title: ["", "veteran", "legend", "champion", "frosty", "ice_breaker", "blizzard"].includes(v.title) ? v.title : ""
   };
@@ -166,6 +166,7 @@ function loadoutForProfile(value, level, ownedItems = []) {
   if (loadout.skin === "candy_cane" && !owned.has("skin_candy_cane")) loadout.skin = "default";
   if (loadout.skin === "frostbite" && !owned.has("skin_frostbite")) loadout.skin = "default";
   if (loadout.skin === "admin" && !owned.has("skin_admin")) loadout.skin = "default";
+  if (loadout.skin === "photo" && !owned.has("skin_photo")) loadout.skin = "default";
   if (loadout.cosmetic === "admin_player" && !owned.has("cosmetic_admin_player")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "urban_camo" && level < 25 && !owned.has("cosmetic_urban_camo")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "scout" && !owned.has("cosmetic_scout")) loadout.cosmetic = "default";
