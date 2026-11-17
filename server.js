@@ -351,6 +351,33 @@ function makeRoom(code, payload = {}) {
   };
 }
 
+// Storm phases. The client has an identical copy of this table and function, so both sides agree
+// on the safe zone from stormTime alone. Each phase holds, then shrinks to its radius.
+const STORM_START_RADIUS = 230;
+const STORM_PHASES = [
+  { hold: 30, shrink: 40, radius: 160, damage: 2 },
+  { hold: 25, shrink: 35, radius: 105, damage: 3 },
+  { hold: 20, shrink: 30, radius: 65,  damage: 5 },
+  { hold: 15, shrink: 25, radius: 40,  damage: 7 },
+  { hold: 10, shrink: 20, radius: 25,  damage: 10 }
+];
+function stormAt(t) {
+  let radius = STORM_START_RADIUS, start = 0;
+  for (let i = 0; i < STORM_PHASES.length; i++) {
+    const p = STORM_PHASES[i];
+    const holdEnd = start + p.hold, shrinkEnd = holdEnd + p.shrink;
+    if (t < holdEnd) return { radius, phase: i + 1, state: "hold", timeLeft: holdEnd - t, nextRadius: p.radius, damage: p.damage };
+    if (t < shrinkEnd) {
+      const k = (t - holdEnd) / p.shrink;
+      return { radius: radius + (p.radius - radius) * k, phase: i + 1, state: "closing", timeLeft: shrinkEnd - t, nextRadius: p.radius, damage: p.damage };
+    }
+    radius = p.radius;
+    start = shrinkEnd;
+  }
+  const last = STORM_PHASES[STORM_PHASES.length - 1];
+  return { radius, phase: STORM_PHASES.length, state: "final", timeLeft: 0, nextRadius: radius, damage: last.damage };
+}
+
 function stateOf(room) {
   return {
     roomCode: room.code,
@@ -1220,6 +1247,8 @@ io.on("connection", socket => {
       if (!current || current.phase !== "countdown" ||
           current.startAt !== scheduledStart) return;
       current.phase = "playing";
+      current.stormTime = 0;
+      current.stormRadius = STORM_START_RADIUS;
       current.progressAwarded = false;
       for (const player of current.players.values()) {
         player.matchXp = 0;
@@ -1555,10 +1584,9 @@ setInterval(() => {
       continue;
     }
 
-    room.stormTime += dt;
-    if (room.stormTime > 15) {
-      room.stormRadius = Math.max(25, room.stormRadius - dt * 0.8);
-    }
+    if (room.phase === "playing") room.stormTime += dt; // the storm only runs during the match
+    const storm = stormAt(room.stormTime);
+    room.stormRadius = storm.radius;
 
     for (const bot of room.bots) {
       if (room.mode === "1v1" || !bot.alive) continue;
@@ -1601,7 +1629,7 @@ setInterval(() => {
       }
 
       if (Math.hypot(bot.x, bot.z) > room.stormRadius) {
-        bot.health -= dt * 2;
+        bot.health -= dt * storm.damage * 0.5;
         if (bot.health <= 0) {
           bot.health = 0;
           bot.alive = false;
@@ -1635,8 +1663,8 @@ setInterval(() => {
     for (const p of room.players.values()) {
       if (p.alive && Math.hypot(p.x, p.z) > room.stormRadius) {
         p._stormDamage = (p._stormDamage || 0) + dt;
-        if (p._stormDamage >= 2) {
-          applyDamage(p, 5);
+        if (p._stormDamage >= 1) {
+          applyDamage(p, storm.damage);
           p._stormDamage = 0;
         }
       } else {
