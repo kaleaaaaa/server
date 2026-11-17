@@ -21,10 +21,14 @@ const ADMIN_GRANTABLE_ITEMS = new Set([
   "weapon_smg", "cosmetic_urban_camo", "cosmetic_elite_armor",
   "weapon_admin_gun", "skin_admin", "skin_photo", "cosmetic_photo", "cosmetic_admin_player",
   "weapon_assault_rifle", "weapon_pistol", "weapon_sniper", "weapon_shockwave_revolver",
-  "weapon_frost_ray", "skin_snow_camo", "title_frosty",
+  "weapon_frost_ray", "weapon_shotgun", "skin_snow_camo", "title_frosty",
   "skin_candy_cane", "skin_frostbite", "cosmetic_snowman", "title_ice_breaker", "title_blizzard"
 ]);
 const FROST_SLOW_MS = 3500;
+// Fastest movement the server accepts (units per second). Sports car tops out near 39; slides, dashes
+// and recoil launches stay under about 34; vertical covers falls and shockwave launches.
+const MAX_MOVE_SPEED = 46;
+const MAX_VERTICAL_SPEED = 55;
 const crypto = require("crypto");
 const DEFAULT_MAX_PLAYERS = 4;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -44,6 +48,8 @@ const SHOP_ITEMS = {
   title_champion: { price: 500, category: "title" },
   weapon_shockwave_revolver: { price: 3000, category: "weapon" },
   weapon_sniper: { price: 1500, category: "weapon" },
+  // Bought directly (see purchaseWithoutRpc), so no change to the Supabase purchase function is needed.
+  weapon_shotgun: { price: 2500, category: "weapon", direct: true },
   // Winter Shop (event "winter"). These are bought directly (see purchaseWithoutRpc) so
   // they work without changing the Supabase purchase_player_item function.
   weapon_frost_ray: { price: 2000, category: "weapon", direct: true, event: "winter" },
@@ -117,7 +123,7 @@ const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "defa
 
 function normalizeLoadout(value) {
   const v = value && typeof value === "object" ? value : {};
-  const weaponIds = ["assault_rifle", "pistol", "smg", "sniper", "shockwave_revolver", "frost_ray", "admin_gun"];
+  const weaponIds = ["assault_rifle", "pistol", "smg", "sniper", "shockwave_revolver", "frost_ray", "shotgun", "admin_gun"];
   return {
     // Any owned/unlocked weapon may be assigned to either weapon slot.
     primary: weaponIds.includes(v.primary) ? v.primary : "assault_rifle",
@@ -152,6 +158,7 @@ function loadoutForProfile(value, level, ownedItems = []) {
     if (id === "sniper") return owned.has("weapon_sniper");
     if (id === "shockwave_revolver") return owned.has("weapon_shockwave_revolver");
     if (id === "frost_ray") return owned.has("weapon_frost_ray");
+    if (id === "shotgun") return owned.has("weapon_shotgun");
     if (id === "admin_gun") return owned.has("weapon_admin_gun");
     return false;
   };
@@ -397,6 +404,7 @@ function stateOf(room) {
       title: p.equippedLoadout?.title || "",
       cosmetic: p.equippedLoadout?.cosmetic || "default",
       photoV: p.photoV || 0,
+      sliding: !!p.sliding,
       weapon: p.weapon || p.equippedLoadout?.primary || "assault_rifle",
       skin: p.equippedLoadout?.skin || "default",
       x: p.x,
@@ -1282,6 +1290,7 @@ io.on("connection", socket => {
       current.stormRadius = STORM_START_RADIUS;
       current.progressAwarded = false;
       for (const player of current.players.values()) {
+        player.moveGraceUntil = Date.now() + 4000;
         player.matchXp = 0;
         player.matchKills = 0;
       }
@@ -1299,13 +1308,30 @@ io.on("connection", socket => {
 
     if (!p || !p.alive) return;
 
-    p.x = number(data.x, p.x);
-    p.y = number(data.y, p.y, -20, 100);
-    p.z = number(data.z, p.z);
+    // Reject impossible jumps in position. Slides, dashes, vehicles and recoil launches are fast,
+    // so the limit is generous; teleports the server itself causes (spawn, respawn) get a grace window.
+    const moveNow = Date.now();
+    const nextX = number(data.x, p.x);
+    const nextY = number(data.y, p.y, -20, 100);
+    const nextZ = number(data.z, p.z);
+    const elapsed = Math.min(1.5, Math.max(0.03, (moveNow - (p.moveAt || moveNow - 50)) / 1000));
+    const overHorizontal = Math.hypot(nextX - p.x, nextZ - p.z) > MAX_MOVE_SPEED * elapsed + 4;
+    const overVertical = Math.abs(nextY - p.y) > MAX_VERTICAL_SPEED * elapsed + 3;
+    p.moveAt = moveNow;
+    if ((overHorizontal || overVertical) && moveNow >= (p.moveGraceUntil || 0)) {
+      p.moveViolations = (p.moveViolations || 0) + 1;
+      if (p.moveViolations % 20 === 1) console.warn(`Movement rejected for ${p.name} (${p.moveViolations} so far).`);
+      socket.emit("positionCorrect", { x: p.x, y: p.y, z: p.z });
+      return;
+    }
+    p.x = nextX;
+    p.y = nextY;
+    p.z = nextZ;
+    p.sliding = data.sliding === true;
     p.yaw = number(data.yaw, p.yaw, -1000, 1000);
     p.pitch = number(data.pitch, p.pitch, -2, 2);
     // Which weapon is in hand (shown on other players' models). Cosmetic only; shooting is checked separately.
-    if (["assault_rifle", "pistol", "smg", "sniper", "shockwave_revolver", "frost_ray", "admin_gun"].includes(data.weapon)) p.weapon = data.weapon;
+    if (["assault_rifle", "pistol", "smg", "sniper", "shockwave_revolver", "frost_ray", "shotgun", "admin_gun"].includes(data.weapon)) p.weapon = data.weapon;
 
     socket.to(room.code).emit("playerMoved", {
       id: p.id,
@@ -1313,6 +1339,7 @@ io.on("connection", socket => {
       title: p.equippedLoadout?.title || "",
       cosmetic: p.equippedLoadout?.cosmetic || "default",
       photoV: p.photoV || 0,
+      sliding: !!p.sliding,
       weapon: p.weapon || p.equippedLoadout?.primary || "assault_rifle",
       skin: p.equippedLoadout?.skin || "default",
       x: p.x,
@@ -1338,7 +1365,7 @@ io.on("connection", socket => {
     const weaponId = slot === "secondary" ? loadout.secondary : loadout.primary;
     if (slot === "secondary" && !weaponId) return;
 
-    const ownershipItem = weaponId === "admin_gun" ? "weapon_admin_gun" : weaponId === "frost_ray" ? "weapon_frost_ray" : "";
+    const ownershipItem = weaponId === "admin_gun" ? "weapon_admin_gun" : weaponId === "frost_ray" ? "weapon_frost_ray" : weaponId === "shotgun" ? "weapon_shotgun" : "";
     if (ownershipItem && !(shooter.ownedItems || []).includes(ownershipItem)) {
       // The server doesn't think this player owns the weapon (for example their profile didn't
       // load when they joined). Re-check their saved items so the next shot can work.
@@ -1348,6 +1375,7 @@ io.on("connection", socket => {
     }
     const weapon = weaponId === "admin_gun" ? { cooldown: 25, damage: 45, speed: 120 }
       : weaponId === "frost_ray" ? { cooldown: 600, damage: 0, speed: 100, range: 120, slowMs: FROST_SLOW_MS }
+      : weaponId === "shotgun" ? { cooldown: 850, damage: 14, speed: 85, range: 32, pellets: 8, spread: 0.07 }
       : weaponId === "pistol" ? { cooldown: 270, damage: 25, speed: 78 }
       : weaponId === "shockwave_revolver" ? { cooldown: 850, damage: 0, speed: 42 }
       : weaponId === "smg" ? { cooldown: 75, damage: 15, speed: 82 }
@@ -1363,13 +1391,26 @@ io.on("connection", socket => {
     const oy = number(o.y, shooter.y + 1.7, -20, 100);
     const oz = number(o.z, shooter.z);
 
-    let dx = number(d.x, 0, -1, 1);
-    let dy = number(d.y, 0, -1, 1);
-    let dz = number(d.z, -1, -1, 1);
-    const len = Math.hypot(dx, dy, dz) || 1;
-    dx /= len;
-    dy /= len;
-    dz /= len;
+    let bx = number(d.x, 0, -1, 1);
+    let by = number(d.y, 0, -1, 1);
+    let bz = number(d.z, -1, -1, 1);
+    const baseLen = Math.hypot(bx, by, bz) || 1;
+    bx /= baseLen;
+    by /= baseLen;
+    bz /= baseLen;
+
+    // Most weapons fire one ray. The Recoil Shotgun fires several, each with its own random spread.
+    for (let pellet = 0; pellet < (weapon.pellets || 1); pellet++) {
+    let dx = bx, dy = by, dz = bz;
+    if (weapon.spread) {
+      dx += (Math.random() - 0.5) * 2 * weapon.spread;
+      dy += (Math.random() - 0.5) * 2 * weapon.spread;
+      dz += (Math.random() - 0.5) * 2 * weapon.spread;
+      const l = Math.hypot(dx, dy, dz) || 1;
+      dx /= l;
+      dy /= l;
+      dz /= l;
+    }
 
     const projectilePayload = {
       shooterId: shooter.id,
@@ -1377,6 +1418,7 @@ io.on("connection", socket => {
       origin: { x: ox, y: oy, z: oz },
       direction: { x: dx, y: dy, z: dz },
       speed: weapon.speed,
+      range: weapon.pellets ? weapon.range : undefined,
       weaponId
     };
     // The Frost Ray is an instant beam; it is sent after the hit check so it can end at the target.
@@ -1447,6 +1489,7 @@ io.on("connection", socket => {
             respawning.x = spawn.x;
             respawning.y = 0;
             respawning.z = spawn.z;
+            respawning.moveGraceUntil = Date.now() + 4000;
             respawning.yaw = targetId === current.hostId ? 0 : Math.PI;
             io.to(targetId).emit("playerRespawned", { id: targetId, x: spawn.x, z: spawn.z });
             emitState(current);
@@ -1458,6 +1501,7 @@ io.on("connection", socket => {
 
     if (weapon.slowMs) {
       socket.to(room.code).emit("playerProjectile", { ...projectilePayload, beam: true, length: beamLength });
+    }
     }
   });
 
