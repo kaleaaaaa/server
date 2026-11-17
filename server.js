@@ -19,7 +19,7 @@ const ADMIN_GRANTABLE_ITEMS = new Set([
   "skin_crimson", "skin_arctic", "cosmetic_scout", "title_champion",
   "skin_neon", "skin_abyss", "title_veteran", "title_legend",
   "weapon_smg", "cosmetic_urban_camo", "cosmetic_elite_armor",
-  "weapon_admin_gun", "skin_admin", "skin_photo", "cosmetic_admin_player",
+  "weapon_admin_gun", "skin_admin", "skin_photo", "cosmetic_photo", "cosmetic_admin_player",
   "weapon_assault_rifle", "weapon_pistol", "weapon_sniper", "weapon_shockwave_revolver",
   "weapon_frost_ray", "skin_snow_camo", "title_frosty",
   "skin_candy_cane", "skin_frostbite", "cosmetic_snowman", "title_ice_breaker", "title_blizzard"
@@ -123,7 +123,7 @@ function normalizeLoadout(value) {
     primary: weaponIds.includes(v.primary) ? v.primary : "assault_rifle",
     secondary: weaponIds.includes(v.secondary) ? v.secondary : null,
     skin: ["default", "neon", "abyss", "crimson", "arctic", "snow_camo", "candy_cane", "frostbite", "admin", "photo"].includes(v.skin) ? v.skin : "default",
-    cosmetic: ["default", "urban_camo", "elite_armor", "scout", "snowman", "admin_player"].includes(v.cosmetic) ? v.cosmetic : "default",
+    cosmetic: ["default", "urban_camo", "elite_armor", "scout", "snowman", "admin_player", "photo_box"].includes(v.cosmetic) ? v.cosmetic : "default",
     title: ["", "veteran", "legend", "champion", "frosty", "ice_breaker", "blizzard"].includes(v.title) ? v.title : ""
   };
 }
@@ -168,6 +168,7 @@ function loadoutForProfile(value, level, ownedItems = []) {
   if (loadout.skin === "admin" && !owned.has("skin_admin")) loadout.skin = "default";
   if (loadout.skin === "photo" && !owned.has("skin_photo")) loadout.skin = "default";
   if (loadout.cosmetic === "admin_player" && !owned.has("cosmetic_admin_player")) loadout.cosmetic = "default";
+  if (loadout.cosmetic === "photo_box" && !owned.has("cosmetic_photo")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "urban_camo" && level < 25 && !owned.has("cosmetic_urban_camo")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "scout" && !owned.has("cosmetic_scout")) loadout.cosmetic = "default";
   if (loadout.cosmetic === "snowman" && !owned.has("cosmetic_snowman")) loadout.cosmetic = "default";
@@ -395,6 +396,7 @@ function stateOf(room) {
       name: p.name,
       title: p.equippedLoadout?.title || "",
       cosmetic: p.equippedLoadout?.cosmetic || "default",
+      photoV: p.photoV || 0,
       x: p.x,
       y: p.y,
       z: p.z,
@@ -811,6 +813,32 @@ io.on("connection", socket => {
       console.error("Could not apply player loadout:", error.message);
       cb?.({ ok: false });
     }
+  });
+
+  // Photo Box outfit: the owner uploads a small JPEG; other players fetch it on demand.
+  socket.on("setPlayerPhoto", (payload = {}, cb = () => {}) => {
+    const room = getRoom(socket);
+    const player = room?.players.get(socket.id);
+    if (!room || !player) return cb?.({ ok: false });
+    if (player.equippedLoadout?.cosmetic !== "photo_box") return cb?.({ ok: false, error: "Photo Box outfit not equipped." });
+    const now = Date.now();
+    if (now - (player.photoAt || 0) < 2000) return cb?.({ ok: false, error: "Too fast." });
+    const url = payload.dataUrl;
+    if (typeof url !== "string" || url.length > 60000 || !/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(url)) {
+      return cb?.({ ok: false, error: "Invalid photo." });
+    }
+    player.photoAt = now;
+    player.photo = url;
+    player.photoV = (player.photoV || 0) + 1;
+    emitState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("requestPlayerPhoto", (payload = {}, cb = () => {}) => {
+    const room = getRoom(socket);
+    const target = room?.players.get(String(payload.id || ""));
+    if (!target || !target.photo || target.equippedLoadout?.cosmetic !== "photo_box") return cb?.({ ok: false });
+    cb?.({ ok: true, dataUrl: target.photo, v: target.photoV || 0 });
   });
 
   socket.on("adminLogin", (payload = {}, cb = () => {}) => {
@@ -1280,6 +1308,7 @@ io.on("connection", socket => {
       name: p.name,
       title: p.equippedLoadout?.title || "",
       cosmetic: p.equippedLoadout?.cosmetic || "default",
+      photoV: p.photoV || 0,
       x: p.x,
       y: p.y,
       z: p.z,
