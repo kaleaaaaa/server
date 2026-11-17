@@ -397,6 +397,8 @@ function stateOf(room) {
       title: p.equippedLoadout?.title || "",
       cosmetic: p.equippedLoadout?.cosmetic || "default",
       photoV: p.photoV || 0,
+      weapon: p.weapon || p.equippedLoadout?.primary || "assault_rifle",
+      skin: p.equippedLoadout?.skin || "default",
       x: p.x,
       y: p.y,
       z: p.z,
@@ -1302,6 +1304,8 @@ io.on("connection", socket => {
     p.z = number(data.z, p.z);
     p.yaw = number(data.yaw, p.yaw, -1000, 1000);
     p.pitch = number(data.pitch, p.pitch, -2, 2);
+    // Which weapon is in hand (shown on other players' models). Cosmetic only; shooting is checked separately.
+    if (["assault_rifle", "pistol", "smg", "sniper", "shockwave_revolver", "frost_ray", "admin_gun"].includes(data.weapon)) p.weapon = data.weapon;
 
     socket.to(room.code).emit("playerMoved", {
       id: p.id,
@@ -1309,6 +1313,8 @@ io.on("connection", socket => {
       title: p.equippedLoadout?.title || "",
       cosmetic: p.equippedLoadout?.cosmetic || "default",
       photoV: p.photoV || 0,
+      weapon: p.weapon || p.equippedLoadout?.primary || "assault_rifle",
+      skin: p.equippedLoadout?.skin || "default",
       x: p.x,
       y: p.y,
       z: p.z,
