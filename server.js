@@ -119,7 +119,19 @@ async function saveShopEvent(id, enabled) {
     return false;
   }
 }
-const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "default", cosmetic: "default", title: "" };
+// Abilities: Q is the movement slot, Z the utility slot (which opens at UTILITY_SLOT_LEVEL).
+// Keep this table in step with the client copy.
+const UTILITY_SLOT_LEVEL = 10;
+const ABILITIES = {
+  dash:      { slot: "move",    level: 1,  cooldown: 3 },
+  air_boost: { slot: "move",    level: 5,  cooldown: 4 },
+  grapple:   { slot: "move",    level: 8,  cooldown: 6 },
+  shield:    { slot: "utility", level: 10, cooldown: 20, durationMs: 3000 },
+  smoke:     { slot: "utility", level: 12, cooldown: 25, durationMs: 8000 },
+  pulse:     { slot: "utility", level: 15, cooldown: 30, durationMs: 2500 }
+};
+const abilityOf = (id, slot) => (typeof id === "string" && Object.hasOwn(ABILITIES, id) && ABILITIES[id].slot === slot ? id : null);
+const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "default", cosmetic: "default", title: "", abilities: { move: "dash", utility: null } };
 
 function normalizeLoadout(value) {
   const v = value && typeof value === "object" ? value : {};
@@ -130,7 +142,11 @@ function normalizeLoadout(value) {
     secondary: weaponIds.includes(v.secondary) ? v.secondary : null,
     skin: ["default", "neon", "abyss", "crimson", "arctic", "snow_camo", "candy_cane", "frostbite", "admin", "photo"].includes(v.skin) ? v.skin : "default",
     cosmetic: ["default", "urban_camo", "elite_armor", "scout", "snowman", "admin_player", "photo_box"].includes(v.cosmetic) ? v.cosmetic : "default",
-    title: ["", "veteran", "legend", "champion", "frosty", "ice_breaker", "blizzard"].includes(v.title) ? v.title : ""
+    title: ["", "veteran", "legend", "champion", "frosty", "ice_breaker", "blizzard"].includes(v.title) ? v.title : "",
+    abilities: {
+      move: abilityOf(v.abilities?.move, "move") || "dash",
+      utility: abilityOf(v.abilities?.utility, "utility")
+    }
   };
 }
 
@@ -162,6 +178,11 @@ function loadoutForProfile(value, level, ownedItems = []) {
     if (id === "admin_gun") return owned.has("weapon_admin_gun");
     return false;
   };
+  // Abilities unlock by level (admin accounts, which own the admin gun, can use them all).
+  const abilityLevel = owned.has("weapon_admin_gun") ? 99 : level;
+  if (ABILITIES[loadout.abilities.move].level > abilityLevel) loadout.abilities.move = "dash";
+  const utility = loadout.abilities.utility;
+  if (utility && (abilityLevel < UTILITY_SLOT_LEVEL || ABILITIES[utility].level > abilityLevel)) loadout.abilities.utility = null;
   if (!canEquipWeapon(loadout.primary)) loadout.primary = "assault_rifle";
   if (level < 2) loadout.secondary = null;
   else if (loadout.secondary && !canEquipWeapon(loadout.secondary)) loadout.secondary = null;
@@ -405,6 +426,7 @@ function stateOf(room) {
       cosmetic: p.equippedLoadout?.cosmetic || "default",
       photoV: p.photoV || 0,
       sliding: !!p.sliding,
+      crouching: !!p.crouching,
       weapon: p.weapon || p.equippedLoadout?.primary || "assault_rifle",
       skin: p.equippedLoadout?.skin || "default",
       x: p.x,
@@ -849,6 +871,28 @@ io.on("connection", socket => {
     const target = room?.players.get(String(payload.id || ""));
     if (!target || !target.photo || target.equippedLoadout?.cosmetic !== "photo_box") return cb?.({ ok: false });
     cb?.({ ok: true, dataUrl: target.photo, v: target.photoV || 0 });
+  });
+
+  // Utility abilities (Z). Movement abilities are client-side and covered by the movement speed check.
+  socket.on("useAbility", (payload = {}, cb = () => {}) => {
+    const room = getRoom(socket);
+    const p = room?.players.get(socket.id);
+    if (!room || !p || !p.alive || room.phase !== "playing") return cb?.({ ok: false });
+    const id = abilityOf(String(payload.id || ""), "utility");
+    if (!id || p.equippedLoadout?.abilities?.utility !== id) return cb?.({ ok: false, error: "Ability not equipped." });
+    const def = ABILITIES[id];
+    const now = Date.now();
+    p.abilityReadyAt ||= {};
+    if (now < (p.abilityReadyAt[id] || 0) - 400) return cb?.({ ok: false, error: "On cooldown." });   // 0.4s of latency slack
+    p.abilityReadyAt[id] = now + def.cooldown * 1000;
+    if (id === "shield") {
+      p.shieldUntil = now + def.durationMs;
+      io.to(room.code).emit("abilityEffect", { id, playerId: p.id, ms: def.durationMs });
+    } else if (id === "smoke") {
+      const fx = -Math.sin(p.yaw || 0), fz = -Math.cos(p.yaw || 0);
+      io.to(room.code).emit("abilityEffect", { id, playerId: p.id, x: p.x + fx * 3, y: 0, z: p.z + fz * 3, ms: def.durationMs });
+    }
+    cb?.({ ok: true });
   });
 
   socket.on("adminLogin", (payload = {}, cb = () => {}) => {
@@ -1328,6 +1372,7 @@ io.on("connection", socket => {
     p.y = nextY;
     p.z = nextZ;
     p.sliding = data.sliding === true;
+    p.crouching = data.crouching === true;
     p.yaw = number(data.yaw, p.yaw, -1000, 1000);
     p.pitch = number(data.pitch, p.pitch, -2, 2);
     // Which weapon is in hand (shown on other players' models). Cosmetic only; shooting is checked separately.
@@ -1340,6 +1385,7 @@ io.on("connection", socket => {
       cosmetic: p.equippedLoadout?.cosmetic || "default",
       photoV: p.photoV || 0,
       sliding: !!p.sliding,
+      crouching: !!p.crouching,
       weapon: p.weapon || p.equippedLoadout?.primary || "assault_rifle",
       skin: p.equippedLoadout?.skin || "default",
       x: p.x,
@@ -1446,6 +1492,16 @@ io.on("connection", socket => {
 
       if (dist < 1.25) {
         if (shotBlockedByBuild(room, ox, oy, oz, tx, ty, tz)) break;
+        if (target.shieldUntil > Date.now()) {
+          // Energy shield: absorbs anything arriving from within about 70 degrees of where the target faces.
+          const fx = -Math.sin(target.yaw || 0), fz = -Math.cos(target.yaw || 0);
+          const sx = ox - tx, sz = oz - tz, sl = Math.hypot(sx, sz) || 1;
+          if ((fx * sx + fz * sz) / sl > 0.34) {
+            io.to(room.code).emit("abilityEffect", { id: "shield_hit", playerId: target.id });
+            beamLength = along;
+            break;
+          }
+        }
         if (weapon.slowMs) {
           // Frost Ray: no damage, only slows the target for a short time.
           io.to(target.id).emit("playerSlowed", { ms: weapon.slowMs, by: shooter.name });
