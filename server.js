@@ -22,7 +22,8 @@ const ADMIN_GRANTABLE_ITEMS = new Set([
   "weapon_admin_gun", "skin_admin", "skin_photo", "cosmetic_photo", "cosmetic_admin_player",
   "weapon_assault_rifle", "weapon_pistol", "weapon_sniper", "weapon_shockwave_revolver",
   "weapon_frost_ray", "weapon_shotgun", "skin_snow_camo", "title_frosty",
-  "skin_candy_cane", "skin_frostbite", "cosmetic_snowman", "title_ice_breaker", "title_blizzard"
+  "skin_candy_cane", "skin_frostbite", "cosmetic_snowman", "title_ice_breaker", "title_blizzard",
+  "ability_air_boost", "ability_grapple", "ability_shield", "ability_smoke", "ability_pulse"
 ]);
 const FROST_SLOW_MS = 3500;
 // Fastest movement the server accepts (units per second). Sports car tops out near 39; slides, dashes
@@ -50,6 +51,12 @@ const SHOP_ITEMS = {
   weapon_sniper: { price: 1500, category: "weapon" },
   // Bought directly (see purchaseWithoutRpc), so no change to the Supabase purchase function is needed.
   weapon_shotgun: { price: 2500, category: "weapon", direct: true },
+  // Abilities cost 1,000 each (dash is free). Bought directly, so no Supabase change is needed.
+  ability_air_boost: { price: 1000, category: "ability", direct: true },
+  ability_grapple: { price: 1000, category: "ability", direct: true },
+  ability_shield: { price: 1000, category: "ability", direct: true },
+  ability_smoke: { price: 1000, category: "ability", direct: true },
+  ability_pulse: { price: 1000, category: "ability", direct: true },
   // Winter Shop (event "winter"). These are bought directly (see purchaseWithoutRpc) so
   // they work without changing the Supabase purchase_player_item function.
   weapon_frost_ray: { price: 2000, category: "weapon", direct: true, event: "winter" },
@@ -119,16 +126,15 @@ async function saveShopEvent(id, enabled) {
     return false;
   }
 }
-// Abilities: Q is the movement slot, Z the utility slot (which opens at UTILITY_SLOT_LEVEL).
+// Abilities: Q is the movement slot, Z the utility slot. Dash is free; the rest are bought (ability_<id>, 1,000 coins).
 // Keep this table in step with the client copy.
-const UTILITY_SLOT_LEVEL = 10;
 const ABILITIES = {
-  dash:      { slot: "move",    level: 1,  cooldown: 3 },
-  air_boost: { slot: "move",    level: 5,  cooldown: 4 },
-  grapple:   { slot: "move",    level: 8,  cooldown: 6 },
-  shield:    { slot: "utility", level: 10, cooldown: 20, durationMs: 3000 },
-  smoke:     { slot: "utility", level: 12, cooldown: 25, durationMs: 8000 },
-  pulse:     { slot: "utility", level: 15, cooldown: 30, durationMs: 2500 }
+  dash:      { slot: "move",    free: true, cooldown: 3 },
+  air_boost: { slot: "move",    cooldown: 4 },
+  grapple:   { slot: "move",    cooldown: 6 },
+  shield:    { slot: "utility", cooldown: 20, durationMs: 3000 },
+  smoke:     { slot: "utility", cooldown: 25, durationMs: 8000 },
+  pulse:     { slot: "utility", cooldown: 30, durationMs: 2500 }
 };
 const abilityOf = (id, slot) => (typeof id === "string" && Object.hasOwn(ABILITIES, id) && ABILITIES[id].slot === slot ? id : null);
 const DEFAULT_LOADOUT = { primary: "assault_rifle", secondary: null, skin: "default", cosmetic: "default", title: "", abilities: { move: "dash", utility: null } };
@@ -178,11 +184,10 @@ function loadoutForProfile(value, level, ownedItems = []) {
     if (id === "admin_gun") return owned.has("weapon_admin_gun");
     return false;
   };
-  // Abilities unlock by level (admin accounts, which own the admin gun, can use them all).
-  const abilityLevel = owned.has("weapon_admin_gun") ? 99 : level;
-  if (ABILITIES[loadout.abilities.move].level > abilityLevel) loadout.abilities.move = "dash";
-  const utility = loadout.abilities.utility;
-  if (utility && (abilityLevel < UTILITY_SLOT_LEVEL || ABILITIES[utility].level > abilityLevel)) loadout.abilities.utility = null;
+  // Abilities must be owned (dash is free). Admin accounts, which own the admin gun, can use them all.
+  const hasAbility = id => !!id && (ABILITIES[id].free || owned.has("ability_" + id) || owned.has("weapon_admin_gun"));
+  if (!hasAbility(loadout.abilities.move)) loadout.abilities.move = "dash";
+  if (!hasAbility(loadout.abilities.utility)) loadout.abilities.utility = null;
   if (!canEquipWeapon(loadout.primary)) loadout.primary = "assault_rifle";
   if (level < 2) loadout.secondary = null;
   else if (loadout.secondary && !canEquipWeapon(loadout.secondary)) loadout.secondary = null;
